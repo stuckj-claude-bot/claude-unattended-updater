@@ -99,6 +99,34 @@ for s in d:
     if started<cut:
         print("\t".join([str(s.get("id")),str(s.get("sessionId")),str(s.get("cwd")),str(s.get("name"))]))
 '
+PY_MOVE_PIN='
+import json, os, shutil, sys, tempfile
+JOBS, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+p = os.path.join(JOBS, "pins.json")
+# Written even when the job was not pinned, so --repair can always tell a
+# resumed session from a pin orphaned by a reaped respawn.
+with open(os.path.join(JOBS, new, ".updater-pin-source"), "w") as fh:
+    fh.write(old + "\n")
+try: pins = json.load(open(p))
+except Exception: raise SystemExit
+if old not in pins: raise SystemExit
+pins[pins.index(old)] = new
+fd, tmp = tempfile.mkstemp(dir=JOBS, prefix=".pins.")
+with os.fdopen(fd, "w") as fh:
+    json.dump(pins, fh, indent=2)
+    fh.flush(); os.fsync(fh.fileno())
+os.replace(tmp, p)
+src, dst = os.path.join(JOBS, old, "order"), os.path.join(JOBS, new, "order")
+if os.path.exists(src) and not os.path.exists(dst):
+    shutil.move(src, dst)
+print(f"    pin moved {old} -> {new}")
+'
+PY_FLAGS='
+import json, sys
+try: d = json.load(open(sys.argv[1]))
+except Exception: raise SystemExit
+for f in (d.get("respawnFlags") or []): print(f)
+'
 PY_WRITE_STATE='
 import json, sys
 rows = [l.split("\t") for l in open(sys.argv[3]).read().splitlines() if l.strip()]
@@ -187,6 +215,7 @@ changed = found = False
 for job in list(pins):
     d = load(job)
     if not d:
+        found = True
         print(f"  {job}: no state.json — leaving alone"); continue
     sid = d.get("resumeSessionId") or d.get("sessionId")
     if transcript_for(sid):
@@ -244,9 +273,13 @@ for job in list(pins):
         shutil.move(src, dst)
     print(f"    repinned {job} -> {other}")
     changed = True
-print("  repinned at least one job" if changed
-      else "  phantom pins found but not repaired" if found
-      else "  no phantom pins found")
+if changed:
+    print("  repinned at least one job")
+elif found:
+    print("  phantom pins found but not repaired")
+    sys.exit(1)
+else:
+    print("  no phantom pins found")
 PY
 }
 
@@ -268,14 +301,16 @@ if [ -z "$want" ]; then
 fi
 
 if [ "$have" = "$want" ] && [ "$FORCE" -eq 0 ]; then
-  pending="$(python3 - "$STATE" <<'PY' 2>/dev/null
+  outstanding="$(python3 - "$STATE" <<'PY' 2>/dev/null
 import json,sys
-try: print(len(json.load(open(sys.argv[1])).get("pending",[])))
+try:
+    d = json.load(open(sys.argv[1]))
+    print(len(d.get("pending",[])) + len(d.get("failed",[])))
 except Exception: print(0)
 PY
 )"
-  [ "${pending:-0}" -eq 0 ] && { log "up to date ($have); nothing pending"; exit 0; }
-  say "up to date ($have) but $pending session(s) pending rollout"
+  [ "${outstanding:-0}" -eq 0 ] && { log "up to date ($have); nothing outstanding"; exit 0; }
+  say "up to date ($have) with $outstanding session(s) outstanding"
 else
   [ "$have" = "$want" ] && say "forced: re-checking rollout at $have" || say "update available: $have -> $want"
   if [ "$DRY" -eq 1 ]; then
@@ -295,47 +330,91 @@ else
     # before the install may still name the previous version.
     EXE="$(readlink -f "$CLAUDE" 2>/dev/null || echo "$CLAUDE")"
     ok=0
-    for _ in $(seq 1 60); do
-      if supervisor_alive; then ok=1; break; fi
-      sleep 1
-    done
+    if [ ! -e "$CLAUDE_DIR/daemon.lock" ]; then
+      ok=2
+    else
+      for _ in $(seq 1 60); do
+        if supervisor_alive; then ok=1; break; fi
+        sleep 1
+      done
+    fi
     if [ "$ok" -eq 1 ]; then
       say "supervisor healthy"
     else
-      if [ ! -e "$CLAUDE_DIR/daemon.lock" ]; then
+      if [ "$ok" -eq 2 ]; then
         say "no agent daemon has run on this host; not starting one"
       else
       say "supervisor lost the EACCES race — restarting it"
       restart_daemon; sleep 15
+      if ! supervisor_alive; then
+        say "supervisor did not come back; not touching any session"; exit 1
+      fi
+      say "supervisor restarted"
       fi
     fi
   fi
 fi
 
-retry_failed() {
-  [ -r "$STATE" ] || return 0
-  local rows; rows="$(python3 - "$STATE" <<'PY'
+PY_READ_FAILED='
 import json, sys
 try: d = json.load(open(sys.argv[1]))
 except Exception: raise SystemExit
 for f in d.get("failed") or []:
     print("\t".join([f.get("id",""), f.get("sessionId",""), f.get("cwd",""), f.get("name","")]))
-PY
-)"
+'
+PY_DROP_FAILED='
+import json, sys
+try: d = json.load(open(sys.argv[1]))
+except Exception: raise SystemExit
+d["failed"] = [f for f in (d.get("failed") or []) if f.get("id") != sys.argv[2]]
+json.dump(d, open(sys.argv[1], "w"), indent=2)
+'
+
+# Resume $sid, replaying the job's respawnFlags, and carry the pin to the job
+# id the resume mints. Prints nothing on success beyond the new id.
+resume_session() {
+  local id="$1" sid="$2" cwd="$3" name="$4" out newid
+  local -a flags=()
+  if [ -r "$JOBS/$id/state.json" ]; then
+    mapfile -t flags < <(python3 -c "$PY_FLAGS" "$JOBS/$id/state.json")
+  else
+    # Resuming without --permission-mode or --model would strand an unattended
+    # session at its first prompt and leave it unfindable by name.
+    say "    cannot read $JOBS/$id/state.json; not resuming $name"
+    return 1
+  fi
+  out="$(cd "$cwd" 2>/dev/null || cd "$HOME" || exit 1; \
+         DISABLE_AUTOUPDATER=1 timeout "$INSTALL_TIMEOUT" \
+           "$CLAUDE" --background --resume "$sid" "${flags[@]}" 2>&1 </dev/null)"
+  newid="$(printf '%s' "$out" | sed 's/\x1b\[[0-9;]*m//g' \
+           | awk '/backgrounded/{for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) {print $i; exit}}')"
+  if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
+    printf '%s\n' "$out" >>"$LOG"
+    return 1
+  fi
+  say "    resumed as $newid"
+  python3 -c "$PY_MOVE_PIN" "$JOBS" "$id" "$newid"
+  return 0
+}
+
+# Sessions an earlier pass stopped but could not bring back are not in the live
+# list, so nothing else rediscovers them.
+retry_failed() {
+  [ "$DRY" -eq 1 ] && return 0
+  [ -r "$STATE" ] || return 0
+  local rows id sid cwd name
+  rows="$(python3 -c "$PY_READ_FAILED" "$STATE")" || return 0
   [ -z "$rows" ] && return 0
-  local id sid cwd name out newid
   while IFS=$'\t' read -r id sid cwd name; do
     [ -z "${sid:-}" ] && continue
-    say "retrying a session an earlier pass stopped but could not resume: $name"
-    out="$(cd "$cwd" 2>/dev/null || cd "$HOME" || exit 1; \
-           DISABLE_AUTOUPDATER=1 timeout "$INSTALL_TIMEOUT" \
-             "$CLAUDE" --background --resume "$sid" 2>&1 </dev/null)"
-    newid="$(printf '%s' "$out" | sed 's/\x1b\[[0-9;]*m//g' \
-             | awk '/backgrounded/{for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) {print $i; exit}}')"
-    if [ -n "$newid" ] && [ -d "$JOBS/$newid" ]; then
-      say "  recovered $name as $newid"
+    say "retrying $name, stopped by an earlier pass and never resumed"
+    if resume_session "$id" "$sid" "$cwd" "$name"; then
+      # Dropped immediately: a later exit path may never rewrite the state file,
+      # and a record left behind forks another live copy every hour.
+      python3 -c "$PY_DROP_FAILED" "$STATE" "$id"
+      say "  recovered $name"
     else
-      say "  still cannot resume $name; leaving it recorded"
+      say "  still cannot resume $name; it stays recorded"
     fi
   done <<< "$rows"
 }
@@ -385,7 +464,7 @@ while IFS=$'\t' read -r id sid cwd name; do
       say "  $name ($id): still busy after ${DEADLINE}s — leaving it for the next run"
       pending="$pending $id"; skip=1; break
     fi
-    st="$(agents_json | python3 -c "$PY_STATUS" "$id")" \
+    st="$(agents_json </dev/null | python3 -c "$PY_STATUS" "$id")" \
       || { say "  $name ($id): session list unreadable; leaving it"; pending="$pending $id"; skip=1; break; }
     case "$st" in
       gone) log "  $name ($id): already gone"; skip=1; break ;;
@@ -397,71 +476,27 @@ while IFS=$'\t' read -r id sid cwd name; do
   [ "$skip" -eq 1 ] && continue
 
   say "  $name ($id): idle — restarting onto $new_version"
-  if [ ! -r "$JOBS/$id/state.json" ]; then
-    say "    cannot read $JOBS/$id/state.json; leaving $name alone"
-    pending="$pending $id"
-    continue
-  fi
-  mapfile -t flags < <(python3 - "$JOBS/$id/state.json" <<'PY'
-import json,sys
-try: d=json.load(open(sys.argv[1]))
-except Exception: raise SystemExit
-for f in (d.get("respawnFlags") or []): print(f)
-PY
-)
   if ! run_claude stop "$id" >>"$LOG" 2>&1 </dev/null; then
-    # Resuming a session that is still running would leave two live copies of
-    # the same conversation, and the stale one would be restarted again next run.
-    say "    stop failed for $name; leaving it alone"
-    pending="$pending $id"
-    continue
+    # A stop that timed out may still have stopped the session; resuming one
+    # that is genuinely still running would leave two live copies.
+    if agents_json </dev/null | python3 -c "$PY_STATUS" "$id" | grep -q '^gone$'; then
+      log "    stop reported failure for $name but the session is gone; continuing"
+    else
+      say "    stop failed for $name; leaving it alone"
+      pending="$pending $id"
+      continue
+    fi
   fi
   sleep 3
-  out="$(cd "$cwd" 2>/dev/null || cd "$HOME" || exit 1; \
-         DISABLE_AUTOUPDATER=1 timeout "$INSTALL_TIMEOUT" \
-           "$CLAUDE" --background --resume "$sid" "${flags[@]}" 2>&1 </dev/null)"
-  # Take the id only from the "backgrounded" announcement: any 8-hex run in an
-  # error message or a stack trace would otherwise be adopted as a job id, and
-  # the pin moved onto a job that does not exist.
-  newid="$(printf '%s' "$out" | sed 's/\x1b\[[0-9;]*m//g' \
-           | awk '/backgrounded/{for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) {print $i; exit}}')"
-  if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
-    # The stop succeeded, so this session is now down. The next run rederives
-    # its work from the live session list and will not see it, so say so loudly
-    # and fail the unit rather than reporting a completed rollout.
-    say "    ERROR: $name ($id) was stopped but did not come back; resume output in $LOG"
-    printf '%s\n' "$out" >>"$LOG"
-    failed="$failed $id"
-    failed_records="${failed_records}${id}\t${sid}\t${cwd}\t${name}\n"
+  if resume_session "$id" "$sid" "$cwd" "$name"; then
     continue
   fi
-  say "    resumed as $newid"
-  python3 - "$JOBS" "$id" "$newid" <<'PY'
-import json, os, shutil, sys, tempfile
-JOBS, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
-p = os.path.join(JOBS, "pins.json")
-try: pins = json.load(open(p))
-except Exception: raise SystemExit
-if old not in pins: raise SystemExit
-pins[pins.index(old)] = new
-# Truncating pins.json in place risks losing every pin at once if the write is
-# interrupted, so swap it atomically.
-fd, tmp = tempfile.mkstemp(dir=JOBS, prefix=".pins.")
-with os.fdopen(fd, "w") as fh:
-    json.dump(pins, fh, indent=2)
-    fh.flush(); os.fsync(fh.fileno())
-os.replace(tmp, p)
-src, dst = os.path.join(JOBS, old, "order"), os.path.join(JOBS, new, "order")
-if os.path.exists(src) and not os.path.exists(dst):
-    shutil.move(src, dst)
-# A resumed session has no transcript until its next prompt, which on disk is
-# indistinguishable from a pin orphaned by a reaped respawn. This records which
-# job the pin came from so --repair can tell them apart, and can put the pin
-# back deterministically if this session dies before it is ever prompted.
-with open(os.path.join(JOBS, new, ".updater-pin-source"), "w") as fh:
-    fh.write(old + "\n")
-print(f"    pin moved {old} -> {new}")
-PY
+  # The stop succeeded, so this session is down and the live list will not
+  # rediscover it next run.
+  say "    ERROR: $name ($id) was stopped but did not come back; see $LOG"
+  failed="$failed $id"
+  failed_records="${failed_records}${id}	${sid}	${cwd}	${name}
+"
 done <<< "$stale"
 
 pending="${pending# }"; failed="${failed# }"
@@ -472,7 +507,7 @@ if [ -n "$pending" ] || [ -n "$failed" ]; then
   # Without this the next run sees "already up to date", finds nothing pending,
   # and these sessions stay on the old binary until the following release.
   recfile="$(mktemp)"
-  printf '%b' "$failed_records" > "$recfile"
+  printf '%s' "$failed_records" > "$recfile"
   python3 -c "$PY_WRITE_STATE" "$STATE" "$new_version" "$recfile" $pending
   rm -f "$recfile"
   [ -n "$pending" ] && say "pending rollout recorded for: $pending"

@@ -169,8 +169,9 @@ phantom pin to the job that really owns the transcript.
   dead supervisor and restarts it, but it cannot prevent the watch from firing.
 - Restarting a session leaves its previous job directory behind: `claude stop`
   does not remove one, and job scratch lives under `~/.claude/jobs/<id>/tmp`.
-  Expect one orphaned directory per restarted session per release, and prune
-  them yourself if the box is tight on space.
+  Expect one orphaned directory per restarted session per release. Pruning them
+  is safe once the restarted session has been prompted at least once; pruning
+  earlier removes what `--repair` needs to put a pin back.
 - Restarting a session starts a fresh context window. It resumes the conversation,
   it does not preserve an in-flight turn — which is why it waits for idle.
 

@@ -2,8 +2,8 @@
 # Rebuild the published APT and YUM repositories from the GitHub releases.
 #
 # Every published package is derived from the releases, so running this twice
-# produces the same repositories and running it after a release adds that
-# release. Nothing reads gh-pages to decide what exists: a deleted release
+# publishes the same packages and indexes; the Release file carries a fresh Date
+# each time, so a re-run still records a commit. Nothing reads gh-pages to decide what exists: a deleted release
 # simply drops out.
 #
 # Unlike a project shipping large binaries, the packages here are a few
@@ -46,12 +46,12 @@ rm -rf "$WORK"; mkdir -p "$WORK/pages/apt/pool/main" "$WORK/pages/yum"
 cd "$WORK"
 
 say "collect package assets from every release of $REPO"
-mapfile -t urls < <(
-  gh api --paginate "repos/$REPO/releases" \
-    --jq '.[] | select(.draft|not) | select(.prerelease|not)
-          | .assets[] | select((.name|endswith(".deb")) or (.name|endswith(".rpm")))
-          | .browser_download_url'
-)
+gh api --paginate "repos/$REPO/releases" \
+  --jq '.[] | select(.draft|not) | select(.prerelease|not)
+        | .assets[] | select((.name|endswith(".deb")) or (.name|endswith(".rpm")))
+        | .browser_download_url' > "$WORK/urls" \
+  || die "could not list the releases of $REPO; refusing to republish from a partial view"
+mapfile -t urls < "$WORK/urls"
 [ "${#urls[@]}" -gt 0 ] || die "no .deb or .rpm assets found in any release of $REPO"
 for u in "${urls[@]}"; do
   n="${u##*/}"
