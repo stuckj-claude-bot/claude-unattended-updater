@@ -124,8 +124,15 @@ d.setdefault("failed", [])
 
 if action == "record":
     ident, sid, cwd, name = sys.argv[3:7]
+    flags = []
+    try:
+        flags = json.load(open(os.path.join(os.path.dirname(path), "jobs", ident,
+                                            "state.json"))).get("respawnFlags") or []
+    except Exception:
+        pass
     d["failed"] = [f for f in d["failed"] if f.get("id") != ident]
-    d["failed"].append({"id": ident, "sessionId": sid, "cwd": cwd, "name": name})
+    d["failed"].append({"id": ident, "sessionId": sid, "cwd": cwd,
+                        "name": name, "respawnFlags": flags})
 elif action == "drop":
     d["failed"] = [f for f in d["failed"] if f.get("id") != sys.argv[3]]
 elif action == "pending":
@@ -168,7 +175,10 @@ with os.fdopen(fd, "w") as fh:
 os.replace(tmp, p)
 src, dst = os.path.join(JOBS, old, "order"), os.path.join(JOBS, new, "order")
 if os.path.exists(src) and not os.path.exists(dst):
-    shutil.move(src, dst)
+    try:
+        shutil.move(src, dst)
+    except OSError as e:
+        print(f"    pin moved but order file left behind: {e}", file=sys.stderr)
 print(f"    pin moved {old} -> {new}")
 '
 PY_FLAGS='
@@ -236,7 +246,7 @@ pins_path = os.path.join(JOBS, "pins.json")
 try:
     pins = json.load(open(pins_path))
 except Exception as e:
-    print(f"  cannot read pins.json: {e}"); raise SystemExit
+    print(f"  cannot read pins.json: {e}"); sys.exit(1)
 
 def load(j):
     try: return json.load(open(os.path.join(JOBS, j, "state.json")))
@@ -346,6 +356,9 @@ fi
 [ -e "$INHIBIT" ] && { say "inhibited by $INHIBIT"; exit 0; }
 
 have="$(installed_version)"
+if [ -z "$have" ]; then
+  say "cannot read the installed version; not installing anything"; exit 1
+fi
 want="$(latest_version)"
 if [ -z "$want" ]; then
   if command -v curl >/dev/null || command -v npm >/dev/null; then
@@ -405,19 +418,29 @@ fi
 
 # Resume $sid, replaying the job's respawnFlags, and carry the pin to the job
 # id the resume mints. Prints nothing on success beyond the new id.
-resume_session() {
-  local id="$1" sid="$2" cwd="$3" name="$4" out newid
-  local -a flags=()
-  # Resuming without --permission-mode or --model would strand an unattended
-  # session at its first prompt and leave it unfindable by name, so an
-  # unreadable or truncated state.json stops the restart rather than degrading it.
-  if ! flagtext="$(python3 -c "$PY_FLAGS" "$JOBS/$id/state.json" 2>>"$LOG")"; then
-    say "    no usable respawnFlags in $JOBS/$id/state.json; not resuming $name"
+# Resuming without --permission-mode or --model would strand an unattended
+# session at its first prompt and leave it unfindable by name, and resuming into
+# the wrong directory silently reroutes every relative path the agent uses.
+restart_possible() {
+  local id="$1" cwd="$2" name="$3"
+  if ! python3 -c "$PY_FLAGS" "$JOBS/$id/state.json" >/dev/null 2>>"$LOG"; then
+    say "    no usable respawnFlags in $JOBS/$id/state.json; leaving $name alone"
     return 1
   fi
+  if [ ! -d "$cwd" ]; then
+    say "    $cwd no longer exists; leaving $name alone"
+    return 1
+  fi
+  return 0
+}
+
+resume_session() {
+  local id="$1" sid="$2" cwd="$3" name="$4" out newid flagtext
+  local -a flags=()
+  flagtext="$(python3 -c "$PY_FLAGS" "$JOBS/$id/state.json" 2>>"$LOG")" || return 1
   mapfile -t flags <<< "$flagtext"
   local since; since="$(date +%s)"
-  out="$(cd "$cwd" 2>/dev/null || cd "$HOME" || exit 1; \
+  out="$(cd "$cwd" || exit 1; \
          DISABLE_AUTOUPDATER=1 timeout "$INSTALL_TIMEOUT" \
            "$CLAUDE" --background --resume "$sid" "${flags[@]}" 2>&1 </dev/null)"
   newid="$(printf '%s' "$out" | sed 's/\x1b\[[0-9;]*m//g' \
@@ -432,10 +455,8 @@ resume_session() {
     return 1
   fi
   say "    resumed as $newid"
-  if ! python3 -c "$PY_MOVE_PIN" "$JOBS" "$id" "$newid"; then
-    say "    WARNING: $name resumed as $newid but its pin could not be moved"
-    return 1
-  fi
+  python3 -c "$PY_MOVE_PIN" "$JOBS" "$id" "$newid" 2>>"$LOG" \
+    || say "    WARNING: $name resumed as $newid but its pin could not be moved; see $LOG"
   return 0
 }
 
@@ -461,6 +482,9 @@ retry_failed() {
   done <<< "$rows"
 }
 retry_failed
+if [ "$DRY" -eq 0 ]; then
+  repair_pins apply >>"$LOG" 2>&1 || true
+fi
 
 new_version="$(installed_version)"
 if ! bin_mtime="$(stat -c %Y "$EXE" 2>/dev/null)"; then
@@ -509,10 +533,13 @@ while IFS=$'\t' read -r id sid cwd name; do
     pending="$pending $id"; continue
   fi
   started_at=$SECONDS
+  local_deadline=$DEADLINE
+  remaining=$(( PASS_DEADLINE - (SECONDS - pass_start) ))
+  [ "$remaining" -lt "$local_deadline" ] && local_deadline=$remaining
   streak=0; skip=0
   while :; do
-    if (( SECONDS - started_at > DEADLINE )); then
-      say "  $name ($id): still busy after ${DEADLINE}s — leaving it for the next run"
+    if (( SECONDS - started_at > local_deadline )); then
+      say "  $name ($id): still busy after ${local_deadline}s — leaving it for the next run"
       pending="$pending $id"; skip=1; break
     fi
     st="$(agents_json </dev/null | python3 -c "$PY_STATUS" "$id")" \
@@ -527,6 +554,10 @@ while IFS=$'\t' read -r id sid cwd name; do
   [ "$skip" -eq 1 ] && continue
 
   say "  $name ($id): idle — restarting onto $new_version"
+  if ! restart_possible "$id" "$cwd" "$name"; then
+    pending="$pending $id"
+    continue
+  fi
   if ! run_claude stop "$id" >>"$LOG" 2>&1 </dev/null; then
     # A stop that timed out may still have stopped the session; resuming one
     # that is genuinely still running would leave two live copies.

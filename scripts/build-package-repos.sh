@@ -66,8 +66,10 @@ for u in "${urls[@]}"; do
 done
 for f in pages/apt/pool/main/*.deb; do
   [ -e "$f" ] || continue
-  dpkg-deb -c "$f" | grep -q 'usr/bin/claude-unattended-update' \
-    || die "$(basename "$f") does not contain usr/bin/claude-unattended-update"
+  # Match the path column exactly: an unanchored search also passes for a
+  # package that merely mentions the name somewhere under another prefix.
+  dpkg-deb -c "$f" | awk '{print $NF}' | grep -qx './usr/bin/claude-unattended-update' \
+    || die "$(basename "$f") does not ship ./usr/bin/claude-unattended-update"
 done
 debs=$(find pages/apt/pool/main -name '*.deb' | wc -l)
 rpms=$(find pages/yum -name '*.rpm' | wc -l)
