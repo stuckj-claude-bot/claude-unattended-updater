@@ -106,7 +106,8 @@ claude-unattended-update --force      # ignore "already up to date"
 claude-unattended-update --repair     # fix pins pointing at a dead session
 ```
 
-Pause it at any time by creating the inhibit file:
+Pause update runs at any time by creating the inhibit file (`--repair` is a
+manual command and runs regardless):
 
 ```bash
 touch ~/.claude/no-auto-update
@@ -124,6 +125,9 @@ touch ~/.claude/no-auto-update
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code config directory |
 | `UPDATER_LOG` | `~/.claude/unattended-update.log` | Log file |
 | `UPDATER_TMUX_SESSION` | `daemon` | tmux session name, with `UPDATER_TMUX_SOCKET` |
+| `UPDATER_PASS_DEADLINE` | `43200` | Give up on the whole pass after this many seconds |
+| `UPDATER_CLAUDE_TIMEOUT` | `120` | Timeout for a single `claude` query |
+| `UPDATER_INSTALL_TIMEOUT` | `900` | Timeout for the install and for a session resume |
 
 A systemd **user** service does not inherit your login shell's environment, so
 exporting these from `~/.bashrc` has no effect on the timer. Set them on the

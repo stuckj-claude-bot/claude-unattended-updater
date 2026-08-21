@@ -36,6 +36,7 @@ PROJECTS="$CLAUDE_DIR/projects"
 POLL="${UPDATER_POLL:-60}"                 # seconds between idle polls
 IDLE_STREAK="${UPDATER_IDLE_STREAK:-2}"    # consecutive idle polls before restarting
 DEADLINE="${UPDATER_DEADLINE:-$((6*60*60))}"       # per session
+INSTALL_TIMEOUT="${UPDATER_INSTALL_TIMEOUT:-900}"
 PASS_DEADLINE="${UPDATER_PASS_DEADLINE:-$((12*60*60))}"  # whole pass
 CLAUDE_TIMEOUT="${UPDATER_CLAUDE_TIMEOUT:-120}"
 
@@ -64,7 +65,7 @@ EXE="$(readlink -f "$CLAUDE" 2>/dev/null || echo "$CLAUDE")"
 # its own, and while it runs the hourly timer is suppressed.
 run_claude() { timeout "$CLAUDE_TIMEOUT" "$CLAUDE" "$@"; }
 
-installed_version() { "$CLAUDE" --version 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+'; }
+installed_version() { run_claude --version 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+'; }
 
 latest_version() {
   if command -v curl >/dev/null; then
@@ -93,9 +94,19 @@ for s in d:
     ts=s.get("startedAt")
     started=float(ts)/1000.0 if isinstance(ts,(int,float)) else None
     if started is None:
-        print("WARN unparsable startedAt for "+str(s.get("id")),file=sys.stderr); continue
+        print("unparsable startedAt for "+str(s.get("id")),file=sys.stderr)
+        sys.exit(1)
     if started<cut:
         print("\t".join([str(s.get("id")),str(s.get("sessionId")),str(s.get("cwd")),str(s.get("name"))]))
+'
+PY_WRITE_STATE='
+import json, sys
+rows = [l.split("\t") for l in open(sys.argv[3]).read().splitlines() if l.strip()]
+json.dump({"rolloutVersion": sys.argv[2],
+           "pending": sys.argv[4:],
+           "failed": [{"id": r[0], "sessionId": r[1], "cwd": r[2], "name": r[3]}
+                      for r in rows if len(r) == 4]},
+          open(sys.argv[1], "w"), indent=2)
 '
 PY_STATUS='
 import json,sys
@@ -160,6 +171,15 @@ def load(j):
     try: return json.load(open(os.path.join(JOBS, j, "state.json")))
     except Exception: return None
 
+def write_pins(pins):
+    # Truncating pins.json in place risks losing every pin if the write is cut
+    # short, so swap it atomically.
+    fd, tmp = tempfile.mkstemp(dir=JOBS, prefix=".pins.")
+    with os.fdopen(fd, "w") as fh:
+        json.dump(pins, fh, indent=2)
+        fh.flush(); os.fsync(fh.fileno())
+    os.replace(tmp, pins_path)
+
 def transcript_for(sid):
     return glob.glob(os.path.join(PROJ, "*", f"{sid}.jsonl")) if sid else []
 
@@ -174,8 +194,21 @@ for job in list(pins):
     if job in live:
         # Running: its transcript appears when it is next prompted.
         continue
-    name, cwd = d.get("name"), d.get("cwd")
     found = True
+    marker = os.path.join(JOBS, job, ".updater-pin-source")
+    if os.path.exists(marker):
+        src = open(marker).read().strip()
+        if os.path.isdir(os.path.join(JOBS, src)):
+            print(f'  {job}: resumed from {src} and never prompted; restoring that pin')
+            if mode == "apply":
+                pins[pins.index(job)] = src
+                write_pins(pins)
+                o_src, o_dst = os.path.join(JOBS, job, "order"), os.path.join(JOBS, src, "order")
+                if os.path.exists(o_src) and not os.path.exists(o_dst):
+                    shutil.move(o_src, o_dst)
+                changed = True
+            continue
+    name, cwd = d.get("name"), d.get("cwd")
     print(f'  {job} ("{name}"): session {sid} has no transcript')
     # A job dir is named for the first 8 chars of its session id, so the owner
     # of a conversation is a job with the same name AND the same cwd whose
@@ -193,22 +226,19 @@ for job in list(pins):
         osid = od.get("resumeSessionId") or od.get("sessionId")
         hits = transcript_for(osid)
         if hits:
-            cands.append((other, osid, os.path.getsize(hits[0])))
+            cands.append((other, osid, os.path.getsize(hits[0]), os.path.getmtime(hits[0])))
     if not cands:
         print("    no replacement found — needs a human"); continue
-    if len(cands) > 1:
-        names = ", ".join(c[0] for c in sorted(cands))
-        print(f"    ambiguous: {names} all match — refusing to guess"); continue
-    other, osid, size = cands[0]
+    cands.sort(key=lambda c: c[3], reverse=True)
+    if len(cands) > 1 and cands[0][3] == cands[1][3]:
+        names = ", ".join(sorted(c[0] for c in cands))
+        print(f"    ambiguous: {names} share a timestamp — refusing to guess"); continue
+    other, osid, size, _ = cands[0]
     print(f"    -> job {other} owns {osid} ({size/1e6:.1f}MB)")
     if mode != "apply":
         continue
     pins[pins.index(job)] = other
-    fd, tmp = tempfile.mkstemp(dir=JOBS, prefix=".pins.")
-    with os.fdopen(fd, "w") as fh:
-        json.dump(pins, fh, indent=2)
-        fh.flush(); os.fsync(fh.fileno())
-    os.replace(tmp, pins_path)
+    write_pins(pins)
     src, dst = os.path.join(JOBS, job, "order"), os.path.join(JOBS, other, "order")
     if os.path.exists(src) and not os.path.exists(dst):
         shutil.move(src, dst)
@@ -223,7 +253,7 @@ PY
 if [ "$REPAIR_ONLY" -eq 1 ]; then
   say "repairing phantom pins..."
   repair_pins "$([ "$DRY" -eq 1 ] && echo report || echo apply)"
-  exit 0
+  exit $?
 fi
 
 [ -e "$INHIBIT" ] && { say "inhibited by $INHIBIT"; exit 0; }
@@ -252,7 +282,7 @@ else
     say "DRY RUN: would install $want now"
   else
     say "installing $want ..."
-    env -u DISABLE_AUTOUPDATER "$CLAUDE" update >>"$LOG" 2>&1 \
+    env -u DISABLE_AUTOUPDATER timeout "$INSTALL_TIMEOUT" "$CLAUDE" update >>"$LOG" 2>&1 \
       || say "installer exited non-zero; see $LOG"
     got="$(installed_version)"
     if [ "$got" != "$want" ]; then
@@ -272,11 +302,44 @@ else
     if [ "$ok" -eq 1 ]; then
       say "supervisor healthy"
     else
+      if [ ! -e "$CLAUDE_DIR/daemon.lock" ]; then
+        say "no agent daemon has run on this host; not starting one"
+      else
       say "supervisor lost the EACCES race — restarting it"
       restart_daemon; sleep 15
+      fi
     fi
   fi
 fi
+
+retry_failed() {
+  [ -r "$STATE" ] || return 0
+  local rows; rows="$(python3 - "$STATE" <<'PY'
+import json, sys
+try: d = json.load(open(sys.argv[1]))
+except Exception: raise SystemExit
+for f in d.get("failed") or []:
+    print("\t".join([f.get("id",""), f.get("sessionId",""), f.get("cwd",""), f.get("name","")]))
+PY
+)"
+  [ -z "$rows" ] && return 0
+  local id sid cwd name out newid
+  while IFS=$'\t' read -r id sid cwd name; do
+    [ -z "${sid:-}" ] && continue
+    say "retrying a session an earlier pass stopped but could not resume: $name"
+    out="$(cd "$cwd" 2>/dev/null || cd "$HOME" || exit 1; \
+           DISABLE_AUTOUPDATER=1 timeout "$INSTALL_TIMEOUT" \
+             "$CLAUDE" --background --resume "$sid" 2>&1 </dev/null)"
+    newid="$(printf '%s' "$out" | sed 's/\x1b\[[0-9;]*m//g' \
+             | awk '/backgrounded/{for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) {print $i; exit}}')"
+    if [ -n "$newid" ] && [ -d "$JOBS/$newid" ]; then
+      say "  recovered $name as $newid"
+    else
+      say "  still cannot resume $name; leaving it recorded"
+    fi
+  done <<< "$rows"
+}
+retry_failed
 
 new_version="$(installed_version)"
 if ! bin_mtime="$(stat -c %Y "$EXE" 2>/dev/null)"; then
@@ -290,7 +353,9 @@ fi
 [ "$DRY" -eq 1 ] && bin_mtime="$(date +%s)"
 
 sessions="$(agents_json)" || { say "could not read the session list; deferring"; exit 0; }
-stale="$(printf '%s' "$sessions" | python3 -c "$PY_STALE" "$bin_mtime")"
+if ! stale="$(printf '%s' "$sessions" | python3 -c "$PY_STALE" "$bin_mtime" 2>>"$LOG")"; then
+  say "could not classify the session list; see $LOG"; exit 1
+fi
 count="$(printf '%s' "$stale" | grep -c . || true)"
 say "sessions still on the old binary: ${count:-0}"
 if [ "${count:-0}" -eq 0 ]; then
@@ -304,7 +369,7 @@ if [ "$DRY" -eq 1 ]; then
   exit 0
 fi
 
-pending=""; failed=""; pass_start=$SECONDS
+pending=""; failed=""; failed_records=""; pass_start=$SECONDS
 while IFS=$'\t' read -r id sid cwd name; do
   [ -z "${id:-}" ] && continue
   # Sessions are handled in order, so a busy one holds up those behind it;
@@ -332,6 +397,11 @@ while IFS=$'\t' read -r id sid cwd name; do
   [ "$skip" -eq 1 ] && continue
 
   say "  $name ($id): idle — restarting onto $new_version"
+  if [ ! -r "$JOBS/$id/state.json" ]; then
+    say "    cannot read $JOBS/$id/state.json; leaving $name alone"
+    pending="$pending $id"
+    continue
+  fi
   mapfile -t flags < <(python3 - "$JOBS/$id/state.json" <<'PY'
 import json,sys
 try: d=json.load(open(sys.argv[1]))
@@ -339,7 +409,7 @@ except Exception: raise SystemExit
 for f in (d.get("respawnFlags") or []): print(f)
 PY
 )
-  if ! run_claude stop "$id" >>"$LOG" 2>&1; then
+  if ! run_claude stop "$id" >>"$LOG" 2>&1 </dev/null; then
     # Resuming a session that is still running would leave two live copies of
     # the same conversation, and the stale one would be restarted again next run.
     say "    stop failed for $name; leaving it alone"
@@ -348,7 +418,8 @@ PY
   fi
   sleep 3
   out="$(cd "$cwd" 2>/dev/null || cd "$HOME" || exit 1; \
-         DISABLE_AUTOUPDATER=1 "$CLAUDE" --background --resume "$sid" "${flags[@]}" 2>&1)"
+         DISABLE_AUTOUPDATER=1 timeout "$INSTALL_TIMEOUT" \
+           "$CLAUDE" --background --resume "$sid" "${flags[@]}" 2>&1 </dev/null)"
   # Take the id only from the "backgrounded" announcement: any 8-hex run in an
   # error message or a stack trace would otherwise be adopted as a job id, and
   # the pin moved onto a job that does not exist.
@@ -361,6 +432,7 @@ PY
     say "    ERROR: $name ($id) was stopped but did not come back; resume output in $LOG"
     printf '%s\n' "$out" >>"$LOG"
     failed="$failed $id"
+    failed_records="${failed_records}${id}\t${sid}\t${cwd}\t${name}\n"
     continue
   fi
   say "    resumed as $newid"
@@ -382,6 +454,12 @@ os.replace(tmp, p)
 src, dst = os.path.join(JOBS, old, "order"), os.path.join(JOBS, new, "order")
 if os.path.exists(src) and not os.path.exists(dst):
     shutil.move(src, dst)
+# A resumed session has no transcript until its next prompt, which on disk is
+# indistinguishable from a pin orphaned by a reaped respawn. This records which
+# job the pin came from so --repair can tell them apart, and can put the pin
+# back deterministically if this session dies before it is ever prompted.
+with open(os.path.join(JOBS, new, ".updater-pin-source"), "w") as fh:
+    fh.write(old + "\n")
 print(f"    pin moved {old} -> {new}")
 PY
 done <<< "$stale"
@@ -390,16 +468,15 @@ pending="${pending# }"; failed="${failed# }"
 if [ -n "$failed" ]; then
   say "sessions stopped that did not come back: $failed"
 fi
-if [ -n "$pending" ]; then
+if [ -n "$pending" ] || [ -n "$failed" ]; then
   # Without this the next run sees "already up to date", finds nothing pending,
   # and these sessions stay on the old binary until the following release.
-  python3 - "$STATE" "$new_version" $pending <<'PY'
-import json, sys
-json.dump({"rolloutVersion": sys.argv[2], "pending": sys.argv[3:]},
-          open(sys.argv[1], "w"), indent=2)
-PY
-  say "pending rollout recorded for: $pending"
-elif [ -z "$failed" ]; then
+  recfile="$(mktemp)"
+  printf '%b' "$failed_records" > "$recfile"
+  python3 -c "$PY_WRITE_STATE" "$STATE" "$new_version" "$recfile" $pending
+  rm -f "$recfile"
+  [ -n "$pending" ] && say "pending rollout recorded for: $pending"
+else
   rm -f "$STATE"
 fi
 
