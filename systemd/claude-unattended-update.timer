@@ -1,0 +1,12 @@
+[Unit]
+Description=Hourly check for a new Claude Code release
+
+[Timer]
+OnCalendar=hourly
+# Spread load off the hour, and catch up after the box was asleep.
+RandomizedDelaySec=5m
+Persistent=true
+Unit=claude-unattended-update.service
+
+[Install]
+WantedBy=timers.target

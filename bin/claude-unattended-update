@@ -1,0 +1,272 @@
+#!/bin/bash
+# Roll a Claude Code update out one session at a time, restarting each session
+# only once it is genuinely idle.
+#
+#   1. cheap version check (exits immediately when there is nothing new)
+#   2. install the new version and wait for it to land completely
+#   3. find sessions still running the old binary
+#   4. per session: wait for idle, stop it, resume it, carry its pin across
+#
+# Doing all four in one engine is the point: nothing else is swapping the
+# binary while a restart is in flight.
+#
+# Two CLI behaviours drive the awkward parts:
+#
+#   * The daemon supervisor watches claude.exe's mtime and re-execs when it
+#     changes. Firing mid-install yields "self-respawn failed: EACCES" and the
+#     orphan watchdog reaps every worker 60s later, so step 2 confirms the
+#     supervisor survived and restarts it if it did not.
+#   * Resuming a session mints a NEW job id and a NEW session id, and writes no
+#     transcript for the new id until that session next receives a prompt. A pin
+#     left on the old job id points at a dead job; step 4 moves it. --repair
+#     fixes pins that already went stale this way.
+#
+# Usage: claude-unattended-update [--dry-run] [--force] [--repair]
+
+set -uo pipefail
+
+PKG=@anthropic-ai/claude-code
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+LOG="${UPDATER_LOG:-$CLAUDE_DIR/unattended-update.log}"
+STATE="$CLAUDE_DIR/unattended-update-state.json"
+INHIBIT="$CLAUDE_DIR/no-auto-update"
+JOBS="$CLAUDE_DIR/jobs"
+PROJECTS="$CLAUDE_DIR/projects"
+
+POLL="${UPDATER_POLL:-60}"                 # seconds between idle polls
+IDLE_STREAK="${UPDATER_IDLE_STREAK:-2}"    # consecutive idle polls before restarting
+DEADLINE="${UPDATER_DEADLINE:-$((6*60*60))}"
+
+DRY=0; FORCE=0; REPAIR_ONLY=0
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRY=1 ;;
+    --force)   FORCE=1 ;;
+    --repair)  REPAIR_ONLY=1 ;;
+    -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  esac
+done
+
+log() { printf '[%s] %s\n' "$(date -Is)" "$*" >>"$LOG"; }
+say() { log "$*"; printf '%s\n' "$*"; return 0; }
+
+# nvm installs are common and put claude outside a login shell's PATH.
+[ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ] && . "${NVM_DIR:-$HOME/.nvm}/nvm.sh" >/dev/null 2>&1
+CLAUDE="${CLAUDE_BIN:-$(command -v claude 2>/dev/null)}"
+[ -z "$CLAUDE" ] && { say "claude not found on PATH; set CLAUDE_BIN"; exit 1; }
+# The wrapper is a symlink into the package; the supervisor watches the real file.
+EXE="$(readlink -f "$CLAUDE" 2>/dev/null || echo "$CLAUDE")"
+
+installed_version() { "$CLAUDE" --version 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+'; }
+agents_json()       { "$CLAUDE" agents --json 2>/dev/null; }
+
+PY_STALE='
+import json,sys
+cut=float(sys.argv[1])
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit
+for s in d:
+    if s.get("kind")!="background": continue
+    ts=s.get("startedAt")
+    started=float(ts)/1000.0 if isinstance(ts,(int,float)) else None
+    if started is None:
+        print("WARN unparsable startedAt for "+str(s.get("id")),file=sys.stderr); continue
+    if started<cut:
+        print("\t".join([str(s.get("id")),str(s.get("sessionId")),str(s.get("cwd")),str(s.get("name"))]))
+'
+PY_STATUS='
+import json,sys
+d=json.load(sys.stdin)
+m=[s for s in d if s.get("id")==sys.argv[1]]
+print(m[0].get("status") if m else "gone")
+'
+
+# `claude agents` owns the supervisor; a headless --json call spawns a transient
+# one and needs no TTY. Set UPDATER_TMUX_SOCKET to keep it in a tmux session.
+restart_daemon() {
+  if [ -n "${UPDATER_TMUX_SOCKET:-}" ]; then
+    tmux -L "$UPDATER_TMUX_SOCKET" kill-server 2>/dev/null || true
+    ( DISABLE_AUTOUPDATER=1 tmux -L "$UPDATER_TMUX_SOCKET" \
+        new-session -d -s "${UPDATER_TMUX_SESSION:-daemon}" "exec $CLAUDE agents" )
+  else
+    DISABLE_AUTOUPDATER=1 "$CLAUDE" agents --json >/dev/null 2>&1 || true
+  fi
+}
+
+supervisor_alive() {
+  python3 - "$CLAUDE_DIR/daemon.lock" <<'PY' 2>/dev/null
+import json,os,sys
+try: pid=json.load(open(sys.argv[1]))["pid"]
+except Exception: sys.exit(1)
+sys.exit(0 if os.path.exists(f"/proc/{pid}") else 1)
+PY
+}
+
+repair_pins() {
+  python3 - "$JOBS" "$PROJECTS" "${1:-report}" <<'PY'
+import json, glob, os, shutil, sys
+JOBS, PROJ, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+pins_path = os.path.join(JOBS, "pins.json")
+try:
+    pins = json.load(open(pins_path))
+except Exception as e:
+    print(f"  cannot read pins.json: {e}"); raise SystemExit
+
+def load(j):
+    try: return json.load(open(os.path.join(JOBS, j, "state.json")))
+    except Exception: return None
+
+def transcript_for(sid):
+    return glob.glob(os.path.join(PROJ, "*", f"{sid}.jsonl")) if sid else []
+
+changed = False
+for job in list(pins):
+    d = load(job)
+    if not d:
+        print(f"  {job}: no state.json — leaving alone"); continue
+    sid = d.get("resumeSessionId") or d.get("sessionId")
+    if transcript_for(sid):
+        continue
+    name = d.get("name")
+    print(f'  {job} ("{name}"): session {sid} has no transcript')
+    # A job dir is named for the first 8 chars of its session id, so the owner
+    # of a conversation is a same-named job whose transcript actually exists.
+    best = None
+    for other in os.listdir(JOBS):
+        if other == job or not os.path.isdir(os.path.join(JOBS, other)):
+            continue
+        od = load(other)
+        if not od or od.get("name") != name:
+            continue
+        osid = od.get("resumeSessionId") or od.get("sessionId")
+        hits = transcript_for(osid)
+        if hits:
+            size = os.path.getsize(hits[0])
+            if not best or size > best[2]:
+                best = (other, osid, size, hits[0])
+    if not best:
+        print("    no replacement found — needs a human"); continue
+    other, osid, size, _ = best
+    print(f"    -> job {other} owns {osid} ({size/1e6:.1f}MB)")
+    if mode != "apply":
+        continue
+    pins[pins.index(job)] = other
+    json.dump(pins, open(pins_path, "w"), indent=2)
+    src, dst = os.path.join(JOBS, job, "order"), os.path.join(JOBS, other, "order")
+    if os.path.exists(src) and not os.path.exists(dst):
+        shutil.move(src, dst)
+    print(f"    repinned {job} -> {other}")
+    changed = True
+print("  repinned at least one job" if changed else "  no phantom pins found")
+PY
+}
+
+if [ "$REPAIR_ONLY" -eq 1 ]; then
+  say "repairing phantom pins..."
+  repair_pins "$([ "$DRY" -eq 1 ] && echo report || echo apply)"
+  exit 0
+fi
+
+[ -e "$INHIBIT" ] && { say "inhibited by $INHIBIT"; exit 0; }
+
+have="$(installed_version)"
+want="$(npm view "$PKG" version 2>/dev/null | tr -d '[:space:]')"
+[ -z "$want" ] && { say "npm unreachable; retry next tick"; exit 0; }
+
+if [ "$have" = "$want" ] && [ "$FORCE" -eq 0 ]; then
+  pending="$(python3 - "$STATE" <<'PY' 2>/dev/null
+import json,sys
+try: print(len(json.load(open(sys.argv[1])).get("pending",[])))
+except Exception: print(0)
+PY
+)"
+  [ "${pending:-0}" -eq 0 ] && { log "up to date ($have); nothing pending"; exit 0; }
+  say "up to date ($have) but $pending session(s) pending rollout"
+else
+  [ "$have" = "$want" ] && say "forced: re-checking rollout at $have" || say "update available: $have -> $want"
+  if [ "$DRY" -eq 1 ]; then
+    say "DRY RUN: would install $want now"
+  else
+    say "installing $want ..."
+    env -u DISABLE_AUTOUPDATER "$CLAUDE" update >>"$LOG" 2>&1
+    say "installer done; version now $(installed_version)"
+    ok=0
+    for _ in $(seq 1 60); do
+      if supervisor_alive; then ok=1; break; fi
+      sleep 1
+    done
+    if [ "$ok" -eq 1 ]; then
+      say "supervisor healthy"
+    else
+      say "supervisor lost the EACCES race — restarting it"
+      restart_daemon; sleep 15
+    fi
+  fi
+fi
+
+new_version="$(installed_version)"
+bin_mtime="$(stat -c %Y "$EXE" 2>/dev/null || echo 0)"
+
+stale="$(agents_json | python3 -c "$PY_STALE" "$bin_mtime")"
+count="$(printf '%s' "$stale" | grep -c . || true)"
+say "sessions still on the old binary: ${count:-0}"
+if [ "${count:-0}" -eq 0 ]; then
+  say "rollout complete at $new_version"; rm -f "$STATE"; exit 0
+fi
+
+if [ "$DRY" -eq 1 ]; then
+  printf '%s\n' "$stale" | sed 's/^/    would-restart-when-idle: /' | tee -a "$LOG"
+  exit 0
+fi
+
+started_at=$SECONDS
+printf '%s\n' "$stale" | while IFS=$'\t' read -r id sid cwd name; do
+  [ -z "${id:-}" ] && continue
+  streak=0; skip=0
+  while :; do
+    (( SECONDS - started_at > DEADLINE )) && { say "deadline hit; leaving $name for next tick"; skip=1; break; }
+    st="$(agents_json | python3 -c "$PY_STATUS" "$id")"
+    case "$st" in
+      gone) log "  $name ($id): already gone"; skip=1; break ;;
+      idle) streak=$((streak+1)); [ "$streak" -ge "$IDLE_STREAK" ] && break ;;
+      *)    streak=0 ;;
+    esac
+    sleep "$POLL"
+  done
+  [ "$skip" -eq 1 ] && continue
+
+  say "  $name ($id): idle — restarting onto $new_version"
+  mapfile -t flags < <(python3 - "$JOBS/$id/state.json" <<'PY'
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: raise SystemExit
+for f in (d.get("respawnFlags") or []): print(f)
+PY
+)
+  "$CLAUDE" stop "$id" >>"$LOG" 2>&1
+  sleep 3
+  out="$(cd "$cwd" 2>/dev/null || cd "$HOME"; \
+         DISABLE_AUTOUPDATER=1 "$CLAUDE" --background --resume "$sid" "${flags[@]}" 2>&1)"
+  newid="$(printf '%s' "$out" | sed 's/\x1b\[[0-9;]*m//g' | grep -oE '[0-9a-f]{8}' | head -1)"
+  if [ -z "$newid" ]; then
+    say "    WARNING: no new job id for $name; pin not moved"
+    continue
+  fi
+  say "    resumed as $newid"
+  python3 - "$JOBS" "$id" "$newid" <<'PY'
+import json, os, shutil, sys
+JOBS, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+p = os.path.join(JOBS, "pins.json")
+try: pins = json.load(open(p))
+except Exception: raise SystemExit
+if old not in pins: raise SystemExit
+pins[pins.index(old)] = new
+json.dump(pins, open(p, "w"), indent=2)
+src, dst = os.path.join(JOBS, old, "order"), os.path.join(JOBS, new, "order")
+if os.path.exists(src) and not os.path.exists(dst):
+    shutil.move(src, dst)
+print(f"    pin moved {old} -> {new}")
+PY
+done
+
+say "rollout pass finished at $new_version"
