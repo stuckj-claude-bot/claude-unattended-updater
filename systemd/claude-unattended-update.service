@@ -7,5 +7,5 @@ Type=oneshot
 # Step 4 waits for each session to finish what it is doing, so a run can sit for
 # hours by design; the script's own UPDATER_DEADLINE bounds it, not systemd.
 TimeoutStartSec=infinity
-ExecStart=%h/.local/bin/claude-unattended-update
+ExecStart=/usr/bin/claude-unattended-update
 SyslogIdentifier=claude-unattended-update

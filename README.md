@@ -32,6 +32,52 @@ and left for you to rediscover.
 
 ## Install
 
+### Debian / Ubuntu (APT)
+
+```bash
+curl -fsSL https://stuckj.github.io/claude-unattended-updater/gpg-key.asc \
+  | sudo tee /usr/share/keyrings/claude-unattended-updater.asc >/dev/null
+
+sudo tee /etc/apt/sources.list.d/claude-unattended-updater.sources >/dev/null <<'SRC'
+Types: deb
+URIs: https://stuckj.github.io/claude-unattended-updater/apt
+Suites: stable
+Components: main
+Signed-By: /usr/share/keyrings/claude-unattended-updater.asc
+SRC
+
+sudo apt update && sudo apt install claude-unattended-updater
+```
+
+The package installs the systemd **user** units; enable them for your own user,
+since the updater drives that user's sessions and needs their `~/.claude`:
+
+```bash
+systemctl --user enable --now claude-unattended-update.timer
+sudo loginctl enable-linger "$USER"   # so it runs while you are logged out
+```
+
+### Fedora / RHEL (YUM/DNF)
+
+```bash
+sudo tee /etc/yum.repos.d/claude-unattended-updater.repo >/dev/null <<'REPO'
+[claude-unattended-updater]
+name=claude-unattended-updater
+baseurl=https://stuckj.github.io/claude-unattended-updater/yum
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://stuckj.github.io/claude-unattended-updater/gpg-key.asc
+REPO
+
+sudo dnf install claude-unattended-updater
+```
+
+`gpgcheck=1` verifies a signature inside each package header, which the release
+workflow adds at build time and refuses to publish without.
+
+### From source
+
 ```bash
 git clone https://github.com/stuckj/claude-unattended-updater
 cd claude-unattended-updater

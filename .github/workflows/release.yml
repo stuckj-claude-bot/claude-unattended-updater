@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  NFPM_VERSION: '2.47.0'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tooling
+        run: |
+          curl -sSfL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | tar xz nfpm
+          sudo install -m 0755 nfpm /usr/local/bin/nfpm
+          sudo apt-get update -qq && sudo apt-get install -y -qq rpm
+
+      - name: Stage signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          umask 077
+          printf '%s' "$GPG_PRIVATE_KEY" > "$RUNNER_TEMP/signing-key.asc"
+          [ -s "$RUNNER_TEMP/signing-key.asc" ] || { echo "GPG_PRIVATE_KEY is empty"; exit 1; }
+
+      - name: Build packages
+        env:
+          GPG_KEY_FILE: ${{ runner.temp }}/signing-key.asc
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          NFPM_RPM_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          # nfpm's default filenames are load-bearing: dpkg-scanpackages --arch
+          # matches *_all.deb, so renaming an asset empties every index.
+          mkdir -p dist
+          export VERSION="${GITHUB_REF_NAME#v}"
+          nfpm package -f nfpm.yaml -p deb -t dist/
+          nfpm package -f nfpm.yaml -p rpm -t dist/
+          ls -l dist/
+
+      - name: Verify package contents
+        run: |
+          deb=$(ls dist/*.deb)
+          dpkg-deb -c "$deb" | grep -q usr/bin/claude-unattended-update
+          dpkg-deb -c "$deb" | grep -q usr/lib/systemd/user/claude-unattended-update.timer
+
+      - name: Verify the rpm is signed in its header
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+        run: |
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --batch --armor --export "$GPG_KEY_ID" > pub.asc
+          [ -s pub.asc ] || { echo "exported public key is empty"; exit 1; }
+          sudo rpm --import pub.asc
+          out=$(rpm --checksig dist/*.rpm)
+          echo "$out"
+          # An unsigned package reports "digests OK" and omits "signatures".
+          # Without this gate a silently unsigned rpm ships and fails at every
+          # install with gpgcheck=1 enabled.
+          echo "$out" | grep -q 'signatures OK' \
+            || { echo "FATAL: rpm header is not signed"; exit 1; }
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.deb dist/*.rpm --generate-notes

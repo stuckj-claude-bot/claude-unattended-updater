@@ -1,0 +1,41 @@
+name: Package repositories
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  # Two rebuilds pushing gh-pages at once would race; the result depends only
+  # on the releases, so serialising is enough.
+  group: package-repos
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install createrepo_c
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq createrepo-c rpm
+
+      - name: Import signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --batch --list-secret-keys --with-colons | grep -q '^sec:' \
+            || { echo "no secret key imported"; exit 1; }
+
+      - name: Build and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          DRY_RUN: '0'
+        run: ./scripts/build-package-repos.sh
