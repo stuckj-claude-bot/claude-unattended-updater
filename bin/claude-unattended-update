@@ -549,7 +549,7 @@ if [ "${count:-0}" -eq 0 ]; then
 fi
 
 if [ "$DRY" -eq 1 ]; then
-  tr '\0' '\n' < "$STALEFILE" | tr '\x1f' ' ' \
+  tr '\0' '\n' < "$STALEFILE" | tr '\037' ' ' \
     | sed 's/^/    would-restart-when-idle: /' | tee -a "$LOG"
   exit 0
 fi
