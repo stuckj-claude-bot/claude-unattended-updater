@@ -11,4 +11,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck -S warning bin/claude-unattended-update install.sh
+        run: shellcheck -S warning bin/claude-unattended-update install.sh scripts/build-package-repos.sh

@@ -43,7 +43,8 @@ for a in "$@"; do
     --dry-run) DRY=1 ;;
     --force)   FORCE=1 ;;
     --repair)  REPAIR_ONLY=1 ;;
-    -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
 
@@ -58,7 +59,23 @@ CLAUDE="${CLAUDE_BIN:-$(command -v claude 2>/dev/null)}"
 EXE="$(readlink -f "$CLAUDE" 2>/dev/null || echo "$CLAUDE")"
 
 installed_version() { "$CLAUDE" --version 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+'; }
-agents_json()       { "$CLAUDE" agents --json 2>/dev/null; }
+
+latest_version() {
+  if command -v curl >/dev/null; then
+    curl -sSfL "https://registry.npmjs.org/$PKG/latest" 2>/dev/null |
+      python3 -c 'import json,sys;print(json.load(sys.stdin).get("version",""))' 2>/dev/null && return
+  fi
+  command -v npm >/dev/null && npm view "$PKG" version 2>/dev/null | tr -d '[:space:]'
+}
+
+# A session list that fails to parse must not read as "nothing to do"; every
+# caller treats an empty list as a completed rollout.
+agents_json() {
+  local out
+  out="$("$CLAUDE" agents --json 2>/dev/null)" || return 1
+  printf '%s' "$out" | python3 -c 'import json,sys;d=json.load(sys.stdin);sys.exit(0 if isinstance(d,list) else 1)' 2>/dev/null || return 1
+  printf '%s' "$out"
+}
 
 PY_STALE='
 import json,sys
@@ -87,7 +104,7 @@ restart_daemon() {
   if [ -n "${UPDATER_TMUX_SOCKET:-}" ]; then
     tmux -L "$UPDATER_TMUX_SOCKET" kill-server 2>/dev/null || true
     ( DISABLE_AUTOUPDATER=1 tmux -L "$UPDATER_TMUX_SOCKET" \
-        new-session -d -s "${UPDATER_TMUX_SESSION:-daemon}" "exec $CLAUDE agents" )
+        new-session -d -s "${UPDATER_TMUX_SESSION:-daemon}" "exec \"$CLAUDE\" agents" )
   else
     DISABLE_AUTOUPDATER=1 "$CLAUDE" agents --json >/dev/null 2>&1 || true
   fi
@@ -95,16 +112,30 @@ restart_daemon() {
 
 supervisor_alive() {
   python3 - "$CLAUDE_DIR/daemon.lock" <<'PY' 2>/dev/null
-import json,os,sys
-try: pid=json.load(open(sys.argv[1]))["pid"]
-except Exception: sys.exit(1)
-sys.exit(0 if os.path.exists(f"/proc/{pid}") else 1)
+import json, os, sys
+try:
+    lock = json.load(open(sys.argv[1]))
+    pid = lock["pid"]
+except Exception:
+    sys.exit(1)
+try:
+    stat = open(f"/proc/{pid}/stat").read()
+except OSError:
+    sys.exit(1)
+want = lock.get("procStart")
+if want:
+    # Field 22 of /proc/pid/stat is starttime; comm can contain spaces and
+    # parentheses, so count fields after the final ')'.
+    fields = stat[stat.rfind(")") + 2:].split()
+    if fields[19] != str(want):
+        sys.exit(1)
+sys.exit(0)
 PY
 }
 
 repair_pins() {
   python3 - "$JOBS" "$PROJECTS" "${1:-report}" <<'PY'
-import json, glob, os, shutil, sys
+import json, glob, os, shutil, sys, tempfile
 JOBS, PROJ, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 pins_path = os.path.join(JOBS, "pins.json")
 try:
@@ -119,7 +150,7 @@ def load(j):
 def transcript_for(sid):
     return glob.glob(os.path.join(PROJ, "*", f"{sid}.jsonl")) if sid else []
 
-changed = False
+changed = found = False
 for job in list(pins):
     d = load(job)
     if not d:
@@ -127,37 +158,49 @@ for job in list(pins):
     sid = d.get("resumeSessionId") or d.get("sessionId")
     if transcript_for(sid):
         continue
-    name = d.get("name")
+    name, cwd = d.get("name"), d.get("cwd")
+    found = True
     print(f'  {job} ("{name}"): session {sid} has no transcript')
     # A job dir is named for the first 8 chars of its session id, so the owner
-    # of a conversation is a same-named job whose transcript actually exists.
-    best = None
+    # of a conversation is a job with the same name AND the same cwd whose
+    # transcript exists. Name alone is not an identity: respawnFlags carry
+    # --name, so unrelated sessions routinely share one.
+    cands = []
     for other in os.listdir(JOBS):
         if other == job or not os.path.isdir(os.path.join(JOBS, other)):
             continue
         od = load(other)
-        if not od or od.get("name") != name:
+        if not od or od.get("name") != name or od.get("cwd") != cwd:
+            continue
+        if other in pins:
             continue
         osid = od.get("resumeSessionId") or od.get("sessionId")
         hits = transcript_for(osid)
         if hits:
-            size = os.path.getsize(hits[0])
-            if not best or size > best[2]:
-                best = (other, osid, size, hits[0])
-    if not best:
+            cands.append((other, osid, os.path.getsize(hits[0])))
+    if not cands:
         print("    no replacement found — needs a human"); continue
-    other, osid, size, _ = best
+    if len(cands) > 1:
+        names = ", ".join(c[0] for c in sorted(cands))
+        print(f"    ambiguous: {names} all match — refusing to guess"); continue
+    other, osid, size = cands[0]
     print(f"    -> job {other} owns {osid} ({size/1e6:.1f}MB)")
     if mode != "apply":
         continue
     pins[pins.index(job)] = other
-    json.dump(pins, open(pins_path, "w"), indent=2)
+    fd, tmp = tempfile.mkstemp(dir=JOBS, prefix=".pins.")
+    with os.fdopen(fd, "w") as fh:
+        json.dump(pins, fh, indent=2)
+        fh.flush(); os.fsync(fh.fileno())
+    os.replace(tmp, pins_path)
     src, dst = os.path.join(JOBS, job, "order"), os.path.join(JOBS, other, "order")
     if os.path.exists(src) and not os.path.exists(dst):
         shutil.move(src, dst)
     print(f"    repinned {job} -> {other}")
     changed = True
-print("  repinned at least one job" if changed else "  no phantom pins found")
+print("  repinned at least one job" if changed
+      else "  phantom pins found but not repaired" if found
+      else "  no phantom pins found")
 PY
 }
 
@@ -170,8 +213,13 @@ fi
 [ -e "$INHIBIT" ] && { say "inhibited by $INHIBIT"; exit 0; }
 
 have="$(installed_version)"
-want="$(npm view "$PKG" version 2>/dev/null | tr -d '[:space:]')"
-[ -z "$want" ] && { say "npm unreachable; retry next tick"; exit 0; }
+want="$(latest_version)"
+if [ -z "$want" ]; then
+  if command -v curl >/dev/null || command -v npm >/dev/null; then
+    say "could not reach the registry; retrying next tick"; exit 0
+  fi
+  say "neither curl nor npm is present; this host cannot check for updates"; exit 1
+fi
 
 if [ "$have" = "$want" ] && [ "$FORCE" -eq 0 ]; then
   pending="$(python3 - "$STATE" <<'PY' 2>/dev/null
@@ -188,8 +236,18 @@ else
     say "DRY RUN: would install $want now"
   else
     say "installing $want ..."
-    env -u DISABLE_AUTOUPDATER "$CLAUDE" update >>"$LOG" 2>&1
-    say "installer done; version now $(installed_version)"
+    env -u DISABLE_AUTOUPDATER "$CLAUDE" update >>"$LOG" 2>&1 \
+      || say "installer exited non-zero; see $LOG"
+    got="$(installed_version)"
+    if [ "$got" != "$want" ]; then
+      # Restarting sessions onto a version that was never installed would cost
+      # the interruption and deliver nothing.
+      say "install did not take: wanted $want, have ${got:-unknown} — see $LOG"; exit 1
+    fi
+    say "installed $got"
+    # The wrapper can point into a per-version directory, so a path resolved
+    # before the install may still name the previous version.
+    EXE="$(readlink -f "$CLAUDE" 2>/dev/null || echo "$CLAUDE")"
     ok=0
     for _ in $(seq 1 60); do
       if supervisor_alive; then ok=1; break; fi
@@ -207,7 +265,8 @@ fi
 new_version="$(installed_version)"
 bin_mtime="$(stat -c %Y "$EXE" 2>/dev/null || echo 0)"
 
-stale="$(agents_json | python3 -c "$PY_STALE" "$bin_mtime")"
+sessions="$(agents_json)" || { say "could not read the session list; deferring"; exit 0; }
+stale="$(printf '%s' "$sessions" | python3 -c "$PY_STALE" "$bin_mtime")"
 count="$(printf '%s' "$stale" | grep -c . || true)"
 say "sessions still on the old binary: ${count:-0}"
 if [ "${count:-0}" -eq 0 ]; then
@@ -219,13 +278,20 @@ if [ "$DRY" -eq 1 ]; then
   exit 0
 fi
 
-started_at=$SECONDS
-printf '%s\n' "$stale" | while IFS=$'\t' read -r id sid cwd name; do
+pending=""
+while IFS=$'\t' read -r id sid cwd name; do
   [ -z "${id:-}" ] && continue
+  # Each session gets its own deadline; one session that stays busy must not
+  # consume the budget for the ones behind it.
+  started_at=$SECONDS
   streak=0; skip=0
   while :; do
-    (( SECONDS - started_at > DEADLINE )) && { say "deadline hit; leaving $name for next tick"; skip=1; break; }
-    st="$(agents_json | python3 -c "$PY_STATUS" "$id")"
+    if (( SECONDS - started_at > DEADLINE )); then
+      say "  $name ($id): still busy after ${DEADLINE}s — leaving it for the next run"
+      pending="$pending $id"; skip=1; break
+    fi
+    st="$(agents_json | python3 -c "$PY_STATUS" "$id")" \
+      || { say "  $name ($id): session list unreadable; leaving it"; pending="$pending $id"; skip=1; break; }
     case "$st" in
       gone) log "  $name ($id): already gone"; skip=1; break ;;
       idle) streak=$((streak+1)); [ "$streak" -ge "$IDLE_STREAK" ] && break ;;
@@ -245,28 +311,53 @@ PY
 )
   "$CLAUDE" stop "$id" >>"$LOG" 2>&1
   sleep 3
-  out="$(cd "$cwd" 2>/dev/null || cd "$HOME"; \
+  out="$(cd "$cwd" 2>/dev/null || cd "$HOME" || exit 1; \
          DISABLE_AUTOUPDATER=1 "$CLAUDE" --background --resume "$sid" "${flags[@]}" 2>&1)"
-  newid="$(printf '%s' "$out" | sed 's/\x1b\[[0-9;]*m//g' | grep -oE '[0-9a-f]{8}' | head -1)"
-  if [ -z "$newid" ]; then
-    say "    WARNING: no new job id for $name; pin not moved"
+  # Take the id only from the "backgrounded" announcement: any 8-hex run in an
+  # error message or a stack trace would otherwise be adopted as a job id, and
+  # the pin moved onto a job that does not exist.
+  newid="$(printf '%s' "$out" | sed 's/\x1b\[[0-9;]*m//g' \
+           | awk '/backgrounded/{for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) {print $i; exit}}')"
+  if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
+    say "    WARNING: resume produced no usable job id for $name; pin left on $id"
+    pending="$pending $id"
     continue
   fi
   say "    resumed as $newid"
   python3 - "$JOBS" "$id" "$newid" <<'PY'
-import json, os, shutil, sys
+import json, os, shutil, sys, tempfile
 JOBS, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
 p = os.path.join(JOBS, "pins.json")
 try: pins = json.load(open(p))
 except Exception: raise SystemExit
 if old not in pins: raise SystemExit
 pins[pins.index(old)] = new
-json.dump(pins, open(p, "w"), indent=2)
+# Truncating pins.json in place risks losing every pin at once if the write is
+# interrupted, so swap it atomically.
+fd, tmp = tempfile.mkstemp(dir=JOBS, prefix=".pins.")
+with os.fdopen(fd, "w") as fh:
+    json.dump(pins, fh, indent=2)
+    fh.flush(); os.fsync(fh.fileno())
+os.replace(tmp, p)
 src, dst = os.path.join(JOBS, old, "order"), os.path.join(JOBS, new, "order")
 if os.path.exists(src) and not os.path.exists(dst):
     shutil.move(src, dst)
 print(f"    pin moved {old} -> {new}")
 PY
-done
+done <<< "$stale"
+
+pending="${pending# }"
+if [ -n "$pending" ]; then
+  # Without this the next run sees "already up to date", finds nothing pending,
+  # and these sessions stay on the old binary until the following release.
+  python3 - "$STATE" "$new_version" $pending <<'PY'
+import json, sys
+json.dump({"rolloutVersion": sys.argv[2], "pending": sys.argv[3:]},
+          open(sys.argv[1], "w"), indent=2)
+PY
+  say "pending rollout recorded for: $pending"
+else
+  rm -f "$STATE"
+fi
 
 say "rollout pass finished at $new_version"

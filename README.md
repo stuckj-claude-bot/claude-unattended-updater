@@ -120,6 +120,21 @@ touch ~/.claude/no-auto-update
 | `UPDATER_TMUX_SOCKET` | unset | Keep the restarted daemon in this tmux socket |
 | `CLAUDE_BIN` | from `PATH` | Path to the `claude` wrapper |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code config directory |
+| `UPDATER_LOG` | `~/.claude/unattended-update.log` | Log file |
+| `UPDATER_TMUX_SESSION` | `daemon` | tmux session name, with `UPDATER_TMUX_SOCKET` |
+
+A systemd **user** service does not inherit your login shell's environment, so
+exporting these from `~/.bashrc` has no effect on the timer. Set them on the
+unit instead:
+
+```bash
+systemctl --user edit claude-unattended-update.service
+# [Service]
+# Environment=UPDATER_DEADLINE=3600
+```
+
+Checking for a new version needs either `curl` or `npm` on `PATH`; with neither,
+the run exits non-zero rather than reporting success.
 
 ## What "idle" means
 

@@ -10,7 +10,7 @@ git push origin v0.1.0
 The [Release workflow](.github/workflows/release.yml) builds the `.deb` and the signed `.rpm` from
 [nfpm.yaml](nfpm.yaml), checks the package actually contains the binary and the
 timer, and creates the GitHub release with the package attached. Publishing the
-release then triggers the [APT workflow](.github/workflows/apt-repo.yml), which
+release then triggers the [package repositories workflow](.github/workflows/package-repos.yml), which
 rebuilds the repository from *all* releases and pushes it to `gh-pages`.
 
 Version comes from the tag with the leading `v` stripped, so `v0.1.0` produces
@@ -66,10 +66,10 @@ gh api -X POST repos/OWNER/REPO/pages -f source[branch]=gh-pages -f source[path]
 ## Rebuild without releasing
 
 The repository is a pure function of the releases, so it can be rebuilt at any
-time from the Actions tab (**APT repository → Run workflow**), or locally:
+time from the Actions tab (**Package repositories → Run workflow**), or locally:
 
 ```bash
-GPG_KEY_ID=... GPG_PASSPHRASE=... ./scripts/build-apt-repo.sh   # dry run
+GPG_KEY_ID=... GPG_PASSPHRASE=... ./scripts/build-package-repos.sh   # dry run
 ```
 
 `DRY_RUN` defaults to `1`; publishing requires `DRY_RUN=0`.

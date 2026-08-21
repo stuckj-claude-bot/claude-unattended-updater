@@ -37,7 +37,8 @@ die() { echo "FATAL: $*" >&2; exit 1; }
 # The signing key is passphrase-protected, so every gpg call feeds it on fd 0.
 gpg_do() {
   printf '%s' "${GPG_PASSPHRASE:-}" |
-    gpg --batch --yes --armor --passphrase-fd 0 --pinentry-mode loopback "$@"
+    gpg --batch --yes --armor --passphrase-fd 0 --pinentry-mode loopback \
+        --local-user "$KEY" "$@"
 }
 
 WORK="$(pwd)/.repobuild"
@@ -47,7 +48,9 @@ cd "$WORK"
 say "collect package assets from every release of $REPO"
 mapfile -t urls < <(
   gh api --paginate "repos/$REPO/releases" \
-    --jq '.[].assets[] | select((.name|endswith(".deb")) or (.name|endswith(".rpm"))) | .browser_download_url'
+    --jq '.[] | select(.draft|not) | select(.prerelease|not)
+          | .assets[] | select((.name|endswith(".deb")) or (.name|endswith(".rpm")))
+          | .browser_download_url'
 )
 [ "${#urls[@]}" -gt 0 ] || die "no .deb or .rpm assets found in any release of $REPO"
 for u in "${urls[@]}"; do
@@ -132,11 +135,14 @@ cat > pages/index.html <<HTML
 HTML
 
 say "verify the APT signature the way apt does"
-gpg --batch --dearmor < pages/gpg-key.asc > verify.gpg
-gpgv --keyring verify.gpg \
-     "pages/apt/dists/$SUITE/Release.gpg" "pages/apt/dists/$SUITE/Release" \
-  >/dev/null 2>&1 || die "the Release signature does not verify against the published key"
-echo "  good signature"
+gpg --batch --dearmor < pages/gpg-key.asc > "$WORK/verify.gpg"
+D="pages/apt/dists/$SUITE"
+gpgv --keyring "$WORK/verify.gpg" "$D/Release.gpg" "$D/Release" 2>&1 \
+  | grep -q 'Good signature' || die "Release.gpg does not verify against the published key"
+# apt fetches InRelease in preference to Release, so verify the file clients use.
+gpgv --keyring "$WORK/verify.gpg" "$D/InRelease" 2>&1 \
+  | grep -q 'Good signature' || die "InRelease does not verify against the published key"
+echo "  Release.gpg and InRelease both verify"
 
 if [ "$rpms" -gt 0 ]; then
   say "verify every rpm carries a header signature"
@@ -158,9 +164,11 @@ if [ "$DRY_RUN" = 1 ]; then
 fi
 
 say "publish to gh-pages"
-git clone --depth 1 --branch gh-pages \
-  "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" ghp 2>/dev/null || {
-    git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" ghp
+# Passing the token as a header keeps it out of ghp/.git/config.
+auth="http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+git -c "$auth" clone --depth 1 --branch gh-pages \
+  "https://github.com/${REPO}.git" ghp 2>/dev/null || {
+    git -c "$auth" clone --depth 1 "https://github.com/${REPO}.git" ghp
     ( cd ghp && git checkout --orphan gh-pages && git rm -rf . >/dev/null 2>&1 || true )
   }
 # Replace only the paths this script owns; anything else on the branch survives.
@@ -175,6 +183,6 @@ if git diff --cached --quiet; then
   echo "  nothing changed"
 else
   git commit -q -m "repos: rebuild from releases ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
-  git push -q origin gh-pages
+  git -c "$auth" push -q origin gh-pages
   echo "  published to $PAGES_URL"
 fi

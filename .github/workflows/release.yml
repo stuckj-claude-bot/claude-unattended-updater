@@ -17,9 +17,15 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install tooling
+        env:
+          NFPM_SHA256: '0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783'
         run: |
-          curl -sSfL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
-            | tar xz nfpm
+          # This job holds the signing key, so the tarball is pinned by digest:
+          # a release asset can be replaced by its owner after the tag exists.
+          curl -sSfL -o nfpm.tgz \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          echo "${NFPM_SHA256}  nfpm.tgz" | sha256sum -c -
+          tar xzf nfpm.tgz nfpm
           sudo install -m 0755 nfpm /usr/local/bin/nfpm
           sudo apt-get update -qq && sudo apt-get install -y -qq rpm
 
