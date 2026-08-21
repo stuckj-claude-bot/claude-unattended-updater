@@ -51,6 +51,9 @@ for a in "$@"; do
   esac
 done
 
+WORKFILE="$(mktemp)"; FLAGFILE="$(mktemp)"; STALEFILE="$(mktemp)"
+trap 'rm -f "$WORKFILE" "$FLAGFILE" "$STALEFILE"' EXIT
+
 log() { printf '[%s] %s\n' "$(date -Is)" "$*" >>"$LOG"; }
 say() { log "$*"; printf '%s\n' "$*"; return 0; }
 
@@ -97,7 +100,7 @@ for s in d:
         print("unparsable startedAt for "+str(s.get("id")),file=sys.stderr)
         sys.exit(1)
     if started<cut:
-        print("\t".join([str(s.get("id")),str(s.get("sessionId")),str(s.get("cwd")),str(s.get("name"))]))
+        sys.stdout.write("\x1f".join([str(s.get("id")),str(s.get("sessionId")),str(s.get("cwd")),str(s.get("name"))])+"\0")
 '
 PY_FIND_NEW='
 import json, sys
@@ -143,6 +146,12 @@ elif action == "read":
         print("\x1f".join([f.get("id",""), f.get("sessionId",""),
                            f.get("cwd",""), f.get("name","")]))
     raise SystemExit
+elif action == "flags":
+    for f in d["failed"]:
+        if f.get("id") == sys.argv[3]:
+            sys.stdout.write("\0".join(f.get("respawnFlags") or []))
+            break
+    raise SystemExit
 elif action == "count":
     print(len(d["pending"]) + len(d["failed"])); raise SystemExit
 
@@ -187,7 +196,7 @@ d = json.load(open(sys.argv[1]))
 flags = d.get("respawnFlags") or []
 if not flags:
     sys.exit(1)
-for f in flags: print(f)
+sys.stdout.write("\0".join(flags))
 '
 PY_STATUS='
 import json,sys
@@ -355,6 +364,13 @@ fi
 
 [ -e "$INHIBIT" ] && { say "inhibited by $INHIBIT"; exit 0; }
 
+# systemd serialises the timer against itself, but a manual run alongside it
+# could stop and resume the same session twice.
+exec 9>"$CLAUDE_DIR/.unattended-update.lock"
+if ! flock -n 9; then
+  say "another run holds the lock; exiting"; exit 0
+fi
+
 have="$(installed_version)"
 if [ -z "$have" ]; then
   say "cannot read the installed version; not installing anything"; exit 1
@@ -367,9 +383,17 @@ if [ -z "$want" ]; then
   say "neither curl nor npm is present; this host cannot check for updates"; exit 1
 fi
 
+if [ "$have" != "$want" ] && [ "$FORCE" -eq 0 ] \
+   && [ "$(printf '%s\n%s\n' "$have" "$want" | sort -V | tail -1)" = "$have" ]; then
+  log "installed $have is newer than the registry's $want; nothing to do"
+  want="$have"
+fi
 if [ "$have" = "$want" ] && [ "$FORCE" -eq 0 ]; then
   outstanding="$(python3 -c "$PY_STATE" "$STATE" count 2>/dev/null)"
-  [ "${outstanding:-0}" -eq 0 ] && { log "up to date ($have); nothing outstanding"; exit 0; }
+  if [ "${outstanding:-0}" -eq 0 ]; then
+    [ "$DRY" -eq 1 ] && say "up to date ($have); nothing outstanding"
+    log "up to date ($have); nothing outstanding"; exit 0
+  fi
   say "up to date ($have) with $outstanding session(s) outstanding"
 else
   [ "$have" = "$want" ] && say "forced: re-checking rollout at $have" || say "update available: $have -> $want"
@@ -435,10 +459,15 @@ restart_possible() {
 }
 
 resume_session() {
-  local id="$1" sid="$2" cwd="$3" name="$4" out newid flagtext
+  local id="$1" sid="$2" cwd="$3" name="$4" out newid
   local -a flags=()
-  flagtext="$(python3 -c "$PY_FLAGS" "$JOBS/$id/state.json" 2>>"$LOG")" || return 1
-  mapfile -t flags <<< "$flagtext"
+  if [ -n "${5:-}" ] && [ -s "$5" ]; then
+    mapfile -d '' -t flags < "$5"
+  else
+    python3 -c "$PY_FLAGS" "$JOBS/$id/state.json" > "$WORKFILE" 2>>"$LOG" || return 1
+    mapfile -d '' -t flags < "$WORKFILE"
+  fi
+  [ "${#flags[@]}" -gt 0 ] || return 1
   local since; since="$(date +%s)"
   out="$(cd "$cwd" || exit 1; \
          DISABLE_AUTOUPDATER=1 timeout "$INSTALL_TIMEOUT" \
@@ -471,7 +500,8 @@ retry_failed() {
   while IFS=$'\x1f' read -r id sid cwd name; do
     [ -z "${sid:-}" ] && continue
     say "retrying $name, stopped by an earlier pass and never resumed"
-    if resume_session "$id" "$sid" "$cwd" "$name"; then
+    python3 -c "$PY_STATE" "$STATE" flags "$id" > "$FLAGFILE" 2>/dev/null
+    if resume_session "$id" "$sid" "$cwd" "$name" "$FLAGFILE"; then
       # Dropped immediately: a later exit path may never rewrite the state file,
       # and a record left behind forks another live copy every hour.
       python3 -c "$PY_STATE" "$STATE" drop "$id"
@@ -498,10 +528,10 @@ fi
 [ "$DRY" -eq 1 ] && bin_mtime="$(date +%s)"
 
 sessions="$(agents_json)" || { say "could not read the session list; deferring"; exit 0; }
-if ! stale="$(printf '%s' "$sessions" | python3 -c "$PY_STALE" "$bin_mtime" 2>>"$LOG")"; then
+if ! printf '%s' "$sessions" | python3 -c "$PY_STALE" "$bin_mtime" > "$STALEFILE" 2>>"$LOG"; then
   say "could not classify the session list; see $LOG"; exit 1
 fi
-count="$(printf '%s' "$stale" | grep -c . || true)"
+count="$(tr -cd '\0' < "$STALEFILE" | wc -c)"
 say "sessions still on the old binary: ${count:-0}"
 if [ "${count:-0}" -eq 0 ]; then
   if [ "$DRY" -eq 0 ]; then
@@ -519,12 +549,13 @@ if [ "${count:-0}" -eq 0 ]; then
 fi
 
 if [ "$DRY" -eq 1 ]; then
-  printf '%s\n' "$stale" | sed 's/^/    would-restart-when-idle: /' | tee -a "$LOG"
+  tr '\0' '\n' < "$STALEFILE" | tr '\x1f' ' ' \
+    | sed 's/^/    would-restart-when-idle: /' | tee -a "$LOG"
   exit 0
 fi
 
 pending=""; failed=""; pass_start=$SECONDS
-while IFS=$'\t' read -r id sid cwd name; do
+while IFS=$'\x1f' read -r -d '' id sid cwd name; do
   [ -z "${id:-}" ] && continue
   # Sessions are handled in order, so a busy one holds up those behind it;
   # PASS_DEADLINE bounds the pass as a whole and DEADLINE bounds each wait.
@@ -538,6 +569,10 @@ while IFS=$'\t' read -r id sid cwd name; do
   [ "$remaining" -lt "$local_deadline" ] && local_deadline=$remaining
   streak=0; skip=0
   while :; do
+    if [ -e "$INHIBIT" ]; then
+      say "  $INHIBIT appeared; leaving $name alone"
+      pending="$pending $id"; skip=1; break
+    fi
     if (( SECONDS - started_at > local_deadline )); then
       say "  $name ($id): still busy after ${local_deadline}s — leaving it for the next run"
       pending="$pending $id"; skip=1; break
@@ -558,6 +593,7 @@ while IFS=$'\t' read -r id sid cwd name; do
     pending="$pending $id"
     continue
   fi
+  python3 -c "$PY_STATE" "$STATE" record "$id" "$sid" "$cwd" "$name"
   if ! run_claude stop "$id" >>"$LOG" 2>&1 </dev/null; then
     # A stop that timed out may still have stopped the session; resuming one
     # that is genuinely still running would leave two live copies.
@@ -565,20 +601,25 @@ while IFS=$'\t' read -r id sid cwd name; do
       log "    stop reported failure for $name but the session is gone; continuing"
     else
       say "    stop failed for $name; leaving it alone"
+      python3 -c "$PY_STATE" "$STATE" drop "$id"
       pending="$pending $id"
       continue
     fi
   fi
   sleep 3
+  for _ in 1 2 3 4 5; do
+    agents_json </dev/null | python3 -c "$PY_STATUS" "$id" | grep -q '^gone$' && break
+    sleep 2
+  done
   if resume_session "$id" "$sid" "$cwd" "$name"; then
+    python3 -c "$PY_STATE" "$STATE" drop "$id"
     continue
   fi
   # The stop succeeded, so this session is down and the live list will not
   # rediscover it next run.
   say "    ERROR: $name ($id) was stopped but did not come back; see $LOG"
   failed="$failed $id"
-  python3 -c "$PY_STATE" "$STATE" record "$id" "$sid" "$cwd" "$name"
-done <<< "$stale"
+done < "$STALEFILE"
 
 pending="${pending# }"; failed="${failed# }"
 if [ -n "$failed" ]; then

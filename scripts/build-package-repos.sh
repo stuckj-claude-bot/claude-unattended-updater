@@ -83,7 +83,7 @@ say "build APT indexes"
     # --arch matches the *_all.deb / *_<arch>.deb filename pattern, not the
     # control file's Architecture field. Renaming an asset away from nfpm's
     # default silently empties every index.
-    dpkg-scanpackages --arch "$a" pool/main 2>/dev/null \
+    dpkg-scanpackages -m --arch "$a" pool/main 2>/dev/null \
       > "dists/$SUITE/main/binary-$a/Packages"
     # dpkg-scanpackages exits 0 and writes nothing when nothing matches;
     # signing that would advertise an empty index with the run still green.

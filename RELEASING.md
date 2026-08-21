@@ -42,6 +42,13 @@ builder repeats the check before publishing.
 Deb needs no equivalent: APT chains trust from the signed `Release` through
 `Packages`' SHA256 to each `.deb`, and does not check per-package signatures.
 
+## Older versions stay installable
+
+The pool on `gh-pages` keeps every released package, and the index is built with
+`dpkg-scanpackages -m`, so `apt install claude-unattended-updater=0.1.0` resolves
+after a bad release. Dropping `-m` silently reduces the index to the newest
+version while the older files stay published.
+
 ## Signing
 
 The APT `Release` file is signed with a key held in repository secrets:

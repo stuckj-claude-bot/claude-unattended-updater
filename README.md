@@ -106,8 +106,12 @@ claude-unattended-update --force      # ignore "already up to date"
 claude-unattended-update --repair     # fix pins pointing at a dead session
 ```
 
-Pause update runs at any time by creating the inhibit file (`--repair` is a
-manual command and runs regardless):
+Every pass also puts back any pin left pointing at a session that cannot be
+resumed, so `--repair` is only needed to inspect or to fix one by hand.
+
+Pause update runs at any time by creating the inhibit file — a pass already
+waiting for a session to go idle notices it too (`--repair` is a manual command
+and runs regardless):
 
 ```bash
 touch ~/.claude/no-auto-update
