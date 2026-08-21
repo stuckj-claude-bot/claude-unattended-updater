@@ -35,7 +35,9 @@ PROJECTS="$CLAUDE_DIR/projects"
 
 POLL="${UPDATER_POLL:-60}"                 # seconds between idle polls
 IDLE_STREAK="${UPDATER_IDLE_STREAK:-2}"    # consecutive idle polls before restarting
-DEADLINE="${UPDATER_DEADLINE:-$((6*60*60))}"
+DEADLINE="${UPDATER_DEADLINE:-$((6*60*60))}"       # per session
+PASS_DEADLINE="${UPDATER_PASS_DEADLINE:-$((12*60*60))}"  # whole pass
+CLAUDE_TIMEOUT="${UPDATER_CLAUDE_TIMEOUT:-120}"
 
 DRY=0; FORCE=0; REPAIR_ONLY=0
 for a in "$@"; do
@@ -58,6 +60,10 @@ CLAUDE="${CLAUDE_BIN:-$(command -v claude 2>/dev/null)}"
 # The wrapper is a symlink into the package; the supervisor watches the real file.
 EXE="$(readlink -f "$CLAUDE" 2>/dev/null || echo "$CLAUDE")"
 
+# A wedged daemon makes these calls hang forever; the unit has no timeout of
+# its own, and while it runs the hourly timer is suppressed.
+run_claude() { timeout "$CLAUDE_TIMEOUT" "$CLAUDE" "$@"; }
+
 installed_version() { "$CLAUDE" --version 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+'; }
 
 latest_version() {
@@ -72,7 +78,7 @@ latest_version() {
 # caller treats an empty list as a completed rollout.
 agents_json() {
   local out
-  out="$("$CLAUDE" agents --json 2>/dev/null)" || return 1
+  out="$(run_claude agents --json 2>/dev/null)" || return 1
   printf '%s' "$out" | python3 -c 'import json,sys;d=json.load(sys.stdin);sys.exit(0 if isinstance(d,list) else 1)' 2>/dev/null || return 1
   printf '%s' "$out"
 }
@@ -134,9 +140,16 @@ PY
 }
 
 repair_pins() {
-  python3 - "$JOBS" "$PROJECTS" "${1:-report}" <<'PY'
+  # A session resumed by a rollout has no transcript until its next prompt,
+  # which is indistinguishable from a phantom pin on disk alone. Liveness tells
+  # them apart, so without a readable session list this refuses to act.
+  local live
+  live="$(agents_json | python3 -c 'import json,sys;print(" ".join(str(s.get("id")) for s in json.load(sys.stdin)))' 2>/dev/null)" \
+    || { say "  cannot read the session list; refusing to repair"; return 1; }
+  python3 - "$JOBS" "$PROJECTS" "${1:-report}" "$live" <<'PY'
 import json, glob, os, shutil, sys, tempfile
 JOBS, PROJ, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+live = set((sys.argv[4] if len(sys.argv) > 4 else "").split())
 pins_path = os.path.join(JOBS, "pins.json")
 try:
     pins = json.load(open(pins_path))
@@ -157,6 +170,9 @@ for job in list(pins):
         print(f"  {job}: no state.json — leaving alone"); continue
     sid = d.get("resumeSessionId") or d.get("sessionId")
     if transcript_for(sid):
+        continue
+    if job in live:
+        # Running: its transcript appears when it is next prompted.
         continue
     name, cwd = d.get("name"), d.get("cwd")
     found = True
@@ -263,14 +279,24 @@ else
 fi
 
 new_version="$(installed_version)"
-bin_mtime="$(stat -c %Y "$EXE" 2>/dev/null || echo 0)"
+if ! bin_mtime="$(stat -c %Y "$EXE" 2>/dev/null)"; then
+  # A zero cutoff makes every session look current, which reads as a finished
+  # rollout when in fact nothing can be assessed.
+  say "cannot stat $EXE; refusing to assess sessions"; exit 1
+fi
+# Nothing is installed during a dry run, so the real cutoff would be the
+# previous install and the preview would under-report. "Now" is what the cutoff
+# becomes once a real install lands.
+[ "$DRY" -eq 1 ] && bin_mtime="$(date +%s)"
 
 sessions="$(agents_json)" || { say "could not read the session list; deferring"; exit 0; }
 stale="$(printf '%s' "$sessions" | python3 -c "$PY_STALE" "$bin_mtime")"
 count="$(printf '%s' "$stale" | grep -c . || true)"
 say "sessions still on the old binary: ${count:-0}"
 if [ "${count:-0}" -eq 0 ]; then
-  say "rollout complete at $new_version"; rm -f "$STATE"; exit 0
+  say "rollout complete at $new_version"
+  [ "$DRY" -eq 0 ] && rm -f "$STATE"
+  exit 0
 fi
 
 if [ "$DRY" -eq 1 ]; then
@@ -278,11 +304,15 @@ if [ "$DRY" -eq 1 ]; then
   exit 0
 fi
 
-pending=""
+pending=""; failed=""; pass_start=$SECONDS
 while IFS=$'\t' read -r id sid cwd name; do
   [ -z "${id:-}" ] && continue
-  # Each session gets its own deadline; one session that stays busy must not
-  # consume the budget for the ones behind it.
+  # Sessions are handled in order, so a busy one holds up those behind it;
+  # PASS_DEADLINE bounds the pass as a whole and DEADLINE bounds each wait.
+  if (( SECONDS - pass_start > PASS_DEADLINE )); then
+    say "  pass deadline reached; leaving $name and any after it for the next run"
+    pending="$pending $id"; continue
+  fi
   started_at=$SECONDS
   streak=0; skip=0
   while :; do
@@ -309,7 +339,13 @@ except Exception: raise SystemExit
 for f in (d.get("respawnFlags") or []): print(f)
 PY
 )
-  "$CLAUDE" stop "$id" >>"$LOG" 2>&1
+  if ! run_claude stop "$id" >>"$LOG" 2>&1; then
+    # Resuming a session that is still running would leave two live copies of
+    # the same conversation, and the stale one would be restarted again next run.
+    say "    stop failed for $name; leaving it alone"
+    pending="$pending $id"
+    continue
+  fi
   sleep 3
   out="$(cd "$cwd" 2>/dev/null || cd "$HOME" || exit 1; \
          DISABLE_AUTOUPDATER=1 "$CLAUDE" --background --resume "$sid" "${flags[@]}" 2>&1)"
@@ -319,8 +355,12 @@ PY
   newid="$(printf '%s' "$out" | sed 's/\x1b\[[0-9;]*m//g' \
            | awk '/backgrounded/{for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) {print $i; exit}}')"
   if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
-    say "    WARNING: resume produced no usable job id for $name; pin left on $id"
-    pending="$pending $id"
+    # The stop succeeded, so this session is now down. The next run rederives
+    # its work from the live session list and will not see it, so say so loudly
+    # and fail the unit rather than reporting a completed rollout.
+    say "    ERROR: $name ($id) was stopped but did not come back; resume output in $LOG"
+    printf '%s\n' "$out" >>"$LOG"
+    failed="$failed $id"
     continue
   fi
   say "    resumed as $newid"
@@ -346,7 +386,10 @@ print(f"    pin moved {old} -> {new}")
 PY
 done <<< "$stale"
 
-pending="${pending# }"
+pending="${pending# }"; failed="${failed# }"
+if [ -n "$failed" ]; then
+  say "sessions stopped that did not come back: $failed"
+fi
 if [ -n "$pending" ]; then
   # Without this the next run sees "already up to date", finds nothing pending,
   # and these sessions stay on the old binary until the following release.
@@ -356,8 +399,10 @@ json.dump({"rolloutVersion": sys.argv[2], "pending": sys.argv[3:]},
           open(sys.argv[1], "w"), indent=2)
 PY
   say "pending rollout recorded for: $pending"
-else
+elif [ -z "$failed" ]; then
   rm -f "$STATE"
 fi
 
 say "rollout pass finished at $new_version"
+[ -n "$failed" ] && exit 1
+exit 0

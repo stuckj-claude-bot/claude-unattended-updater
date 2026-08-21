@@ -20,8 +20,7 @@ point of driving Claude Code from a phone.
 
 One engine owns the whole sequence, so nothing races it:
 
-1. **Check** hourly for a new release. Nothing new, exit immediately — it is one
-   `npm view` call.
+1. **Check** hourly for a new release. Nothing new, exit immediately — it is one registry lookup.
 2. **Install** the new version and wait for it to land completely.
 3. **Find** sessions still running the old binary.
 4. **Restart** each one *only once it is genuinely idle*, then move its pin across.
@@ -84,16 +83,19 @@ cd claude-unattended-updater
 ./install.sh
 ```
 
-Then turn off the built-in updater so this is the only thing swapping the binary:
+### Required for every install method: disable the built-in updater
+
+This tool only helps if it is the *only* thing swapping the binary:
 
 ```bash
 # ~/.claude/settings.json
 { "env": { "DISABLE_AUTOUPDATER": "1" } }
 ```
 
-Restart any long-lived `claude` process afterwards — `claude agents`, `claude
+Then restart every long-lived `claude` process — `claude agents`, `claude
 remote-control`, and your login shell. A process started before that setting was
-written keeps its old environment and will carry on updating behind your back.
+written keeps its old environment and carries on updating behind your back,
+which is the failure this tool exists to prevent.
 
 ## Usage
 
@@ -161,6 +163,10 @@ phantom pin to the job that really owns the transcript.
 - The supervisor's own mtime watch cannot be unsubscribed. Installing while all
   sessions are idle bounds the damage of a lost race, and the engine detects a
   dead supervisor and restarts it, but it cannot prevent the watch from firing.
+- Restarting a session leaves its previous job directory behind: `claude stop`
+  does not remove one, and job scratch lives under `~/.claude/jobs/<id>/tmp`.
+  Expect one orphaned directory per restarted session per release, and prune
+  them yourself if the box is tight on space.
 - Restarting a session starts a fresh context window. It resumes the conversation,
   it does not preserve an in-flight turn — which is why it waits for idle.
 

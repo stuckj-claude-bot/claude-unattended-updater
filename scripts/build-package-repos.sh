@@ -62,6 +62,11 @@ for u in "${urls[@]}"; do
   esac
   curl -sSfL "$u" -o "$dest" || die "download failed: $u"
 done
+for f in pages/apt/pool/main/*.deb; do
+  [ -e "$f" ] || continue
+  dpkg-deb -c "$f" | grep -q 'usr/bin/claude-unattended-update' \
+    || die "$(basename "$f") does not contain usr/bin/claude-unattended-update"
+done
 debs=$(find pages/apt/pool/main -name '*.deb' | wc -l)
 rpms=$(find pages/yum -name '*.rpm' | wc -l)
 echo "  $debs deb(s), $rpms rpm(s)"
@@ -165,16 +170,24 @@ fi
 
 say "publish to gh-pages"
 # Passing the token as a header keeps it out of ghp/.git/config.
-auth="http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-git -c "$auth" clone --depth 1 --branch gh-pages \
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+export GIT_CONFIG_VALUE_0
+git clone --depth 1 --branch gh-pages \
   "https://github.com/${REPO}.git" ghp 2>/dev/null || {
-    git -c "$auth" clone --depth 1 "https://github.com/${REPO}.git" ghp
+    git clone --depth 1 "https://github.com/${REPO}.git" ghp
     ( cd ghp && git checkout --orphan gh-pages && git rm -rf . >/dev/null 2>&1 || true )
   }
 # Replace only the paths this script owns; anything else on the branch survives.
-rm -rf ghp/apt ghp/yum ghp/gpg-key.asc ghp/index.html
+rm -rf ghp/apt ghp/gpg-key.asc ghp/index.html
 cp -r pages/apt pages/gpg-key.asc pages/index.html ghp/
-[ "$rpms" -gt 0 ] && cp -r pages/yum ghp/
+if [ "$rpms" -gt 0 ]; then
+  rm -rf ghp/yum
+  cp -r pages/yum ghp/
+elif [ -d ghp/yum ]; then
+  echo "  no rpm assets in any release; leaving the published yum repository alone"
+fi
 cd ghp
 git config user.name  "github-actions[bot]"
 git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -183,6 +196,6 @@ if git diff --cached --quiet; then
   echo "  nothing changed"
 else
   git commit -q -m "repos: rebuild from releases ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
-  git -c "$auth" push -q origin gh-pages
+  git push -q origin gh-pages
   echo "  published to $PAGES_URL"
 fi

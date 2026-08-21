@@ -19,6 +19,9 @@ depends:
   - bash
   - python3
 
+recommends:
+  - curl
+
 contents:
   - src: bin/claude-unattended-update
     dst: /usr/bin/claude-unattended-update
