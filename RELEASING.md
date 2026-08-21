@@ -9,9 +9,13 @@ git push origin v0.1.0
 
 The [Release workflow](.github/workflows/release.yml) builds the `.deb` and the signed `.rpm` from
 [nfpm.yaml](nfpm.yaml), checks the package actually contains the binary and the
-timer, and creates the GitHub release with the package attached. Publishing the
-release then triggers the [package repositories workflow](.github/workflows/package-repos.yml), which
-rebuilds the repository from *all* releases and pushes it to `gh-pages`.
+timer, and creates the GitHub release with the package attached. The
+[package repositories workflow](.github/workflows/package-repos.yml) then
+rebuilds the repositories from *all* releases and pushes them to `gh-pages`.
+
+That workflow is chained to the Release workflow *completing*, not to the
+release being published: a release created with `GITHUB_TOKEN` does not start
+another workflow run, so `on: release` would never fire.
 
 Version comes from the tag with the leading `v` stripped, so `v0.1.0` produces
 `claude-unattended-updater_0.1.0_all.deb`.
@@ -56,7 +60,7 @@ exported key.
 ## First-time setup
 
 GitHub Pages must be serving the `gh-pages` branch. The branch is created by the
-first successful APT workflow run; enable Pages for it afterwards under
+first successful Package repositories run; enable Pages for it afterwards under
 **Settings → Pages**, or:
 
 ```bash

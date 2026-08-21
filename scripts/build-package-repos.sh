@@ -3,8 +3,10 @@
 #
 # Every published package is derived from the releases, so running this twice
 # publishes the same packages and indexes; the Release file carries a fresh Date
-# each time, so a re-run still records a commit. Nothing reads gh-pages to decide what exists: a deleted release
-# simply drops out.
+# each time, so a re-run still records a commit. Nothing reads gh-pages to decide
+# what exists, so a deleted release drops out of the APT repository. The YUM tree
+# is the exception: it is replaced only when this run collected at least one rpm,
+# so a deb-only release does not publish a deletion of it.
 #
 # Unlike a project shipping large binaries, the packages here are a few
 # kilobytes, so gh-pages carries the whole pool rather than only the current
@@ -118,7 +120,13 @@ PY
 
 if [ "$rpms" -gt 0 ]; then
   say "build YUM repodata"
-  command -v createrepo_c >/dev/null || die "createrepo_c is required to publish the yum repository"
+  if ! command -v createrepo_c >/dev/null; then
+    [ "$DRY_RUN" = 1 ] || die "createrepo_c is required to publish the yum repository"
+    echo "  createrepo_c missing; skipping yum metadata in this dry run"
+    rpms=0
+  fi
+fi
+if [ "$rpms" -gt 0 ]; then
   createrepo_c --quiet pages/yum
   # repomd.xml.asc covers the metadata (repo_gpgcheck). The packages themselves
   # are signed in their headers at build time, which is what gpgcheck verifies —
