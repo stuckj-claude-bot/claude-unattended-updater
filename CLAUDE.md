@@ -46,7 +46,10 @@ package asset away from nfpm's default produces empty indexes with every command
 still exiting 0. `scripts/build-package-repos.sh` fails loudly on an empty index
 for this reason — do not "fix" that guard by removing it.
 
-**An unsigned rpm is not a build error.** `rpm --checksig` reports `digests OK`
-for an unsigned package and `digests signatures OK` for a signed one; both exit
-0. Only the header signature satisfies `gpgcheck=1` — signing `repomd.xml` does
-not. The release workflow greps for `signatures OK` explicitly.
+**An unsigned rpm is not a build error, and `rpm --checksig` cannot tell you so
+here.** Only the header signature satisfies `gpgcheck=1`; signing `repomd.xml`
+does not. `rpm --checksig` checks against rpm's own keyring, and `rpm --import`
+needs an initialised rpm database, which Debian-family hosts lack — it fails
+silently, taking the check with it. Both the release workflow and the repository
+builder read `%{RSAHEADER:pgpsig}` and `%{SIGPGP:pgpsig}` off the package
+instead, and treat `(none)|(none)` as unsigned.

@@ -66,7 +66,7 @@ EXE="$(readlink -f "$CLAUDE" 2>/dev/null || echo "$CLAUDE")"
 
 # A wedged daemon makes these calls hang forever; the unit has no timeout of
 # its own, and while it runs the hourly timer is suppressed.
-run_claude() { timeout "$CLAUDE_TIMEOUT" "$CLAUDE" "$@"; }
+run_claude() { DISABLE_AUTOUPDATER=1 timeout "$CLAUDE_TIMEOUT" "$CLAUDE" "$@"; }
 
 installed_version() { run_claude --version 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+'; }
 
@@ -102,6 +102,10 @@ for s in d:
     if started<cut:
         sys.stdout.write("\x1f".join([str(s.get("id")),str(s.get("sessionId")),str(s.get("cwd")),str(s.get("name"))])+"\0")
 '
+find_live() {
+  agents_json </dev/null | python3 -c "$PY_FIND_NEW" "$1" "$2" 0 2>/dev/null
+}
+
 PY_FIND_NEW='
 import json, sys
 cwd, name, since = sys.argv[1], sys.argv[2], float(sys.argv[3])
@@ -255,6 +259,8 @@ pins_path = os.path.join(JOBS, "pins.json")
 try:
     pins = json.load(open(pins_path))
 except Exception as e:
+    if isinstance(e, FileNotFoundError):
+        print("  no pins.json; nothing to repair"); raise SystemExit
     print(f"  cannot read pins.json: {e}"); sys.exit(1)
 
 def load(j):
@@ -362,13 +368,95 @@ if [ "$REPAIR_ONLY" -eq 1 ]; then
   exit $?
 fi
 
-[ -e "$INHIBIT" ] && { say "inhibited by $INHIBIT"; exit 0; }
+[ -e "$INHIBIT" ] && [ "$DRY" -eq 0 ] && { say "inhibited by $INHIBIT"; exit 0; }
+[ -e "$INHIBIT" ] && say "note: $INHIBIT is present; this is a dry run so it reports anyway"
 
 # systemd serialises the timer against itself, but a manual run alongside it
 # could stop and resume the same session twice.
 exec 9>"$CLAUDE_DIR/.unattended-update.lock"
 if ! flock -n 9; then
   say "another run holds the lock; exiting"; exit 0
+fi
+
+restart_possible() {
+  local id="$1" cwd="$2" name="$3"  # $4 = session id
+  if ! python3 -c "$PY_FLAGS" "$JOBS/$id/state.json" >/dev/null 2>>"$LOG"; then
+    say "    no usable respawnFlags in $JOBS/$id/state.json; leaving $name alone"
+    return 1
+  fi
+  if [ ! -d "$cwd" ]; then
+    say "    $cwd no longer exists; leaving $name alone"
+    return 1
+  fi
+  case "${4:-}" in
+    ""|None|null) say "    no session id for $name; leaving it alone"; return 1 ;;
+  esac
+  return 0
+}
+
+resume_session() {
+  local id="$1" sid="$2" cwd="$3" name="$4" out newid
+  local -a flags=()
+  if [ -n "${5:-}" ] && [ -s "$5" ]; then
+    mapfile -d '' -t flags < "$5"
+  else
+    python3 -c "$PY_FLAGS" "$JOBS/$id/state.json" > "$WORKFILE" 2>>"$LOG" || return 1
+    mapfile -d '' -t flags < "$WORKFILE"
+  fi
+  [ "${#flags[@]}" -gt 0 ] || return 1
+  local since; since="$(date +%s)"
+  out="$(cd "$cwd" || exit 1; \
+         DISABLE_AUTOUPDATER=1 timeout "$INSTALL_TIMEOUT" \
+           "$CLAUDE" --background --resume "$sid" "${flags[@]}" 2>&1 </dev/null)"
+  newid="$(printf '%s' "$out" | sed 's/\x1b\[[0-9;]*m//g' \
+           | awk '/backgrounded/{for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) {print $i; exit}}')"
+  if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
+    # Failing to read the announcement is not evidence that no session started,
+    # and recording a live session as failed makes the retry fork a second copy.
+    newid="$(agents_json </dev/null | python3 -c "$PY_FIND_NEW" "$cwd" "$name" "$since")"
+  fi
+  if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
+    printf '%s\n' "$out" >>"$LOG"
+    return 1
+  fi
+  say "    resumed as $newid"
+  python3 -c "$PY_MOVE_PIN" "$JOBS" "$id" "$newid" >>"$LOG" 2>&1 \
+    || say "    WARNING: $name resumed as $newid but its pin could not be moved; see $LOG"
+  return 0
+}
+
+# Sessions an earlier pass stopped but could not bring back are not in the live
+# list, so nothing else rediscovers them.
+retry_failed() {
+  [ "$DRY" -eq 1 ] && return 0
+  [ -r "$STATE" ] || return 0
+  local rows id sid cwd name
+  rows="$(python3 -c "$PY_STATE" "$STATE" read)" || return 0
+  [ -z "$rows" ] && return 0
+  while IFS=$'\x1f' read -r id sid cwd name; do
+    [ -z "${sid:-}" ] && continue
+    if [ -n "$(find_live "$cwd" "$name")" ]; then
+      # A pass killed between the resume and dropping the record would
+      # otherwise fork a second agent on the same conversation.
+      say "  $name is already running; clearing its record"
+      python3 -c "$PY_STATE" "$STATE" drop "$id"
+      continue
+    fi
+    say "retrying $name, stopped by an earlier pass and never resumed"
+    python3 -c "$PY_STATE" "$STATE" flags "$id" > "$FLAGFILE" 2>/dev/null
+    if resume_session "$id" "$sid" "$cwd" "$name" "$FLAGFILE"; then
+      # Dropped immediately: a later exit path may never rewrite the state file,
+      # and a record left behind forks another live copy every hour.
+      python3 -c "$PY_STATE" "$STATE" drop "$id"
+      say "  recovered $name"
+    else
+      say "  still cannot resume $name; it stays recorded"
+    fi
+  done <<< "$rows"
+}
+if [ "$DRY" -eq 0 ]; then
+  retry_failed
+  repair_pins apply >>"$LOG" 2>&1 || true
 fi
 
 have="$(installed_version)"
@@ -445,77 +533,6 @@ fi
 # Resuming without --permission-mode or --model would strand an unattended
 # session at its first prompt and leave it unfindable by name, and resuming into
 # the wrong directory silently reroutes every relative path the agent uses.
-restart_possible() {
-  local id="$1" cwd="$2" name="$3"
-  if ! python3 -c "$PY_FLAGS" "$JOBS/$id/state.json" >/dev/null 2>>"$LOG"; then
-    say "    no usable respawnFlags in $JOBS/$id/state.json; leaving $name alone"
-    return 1
-  fi
-  if [ ! -d "$cwd" ]; then
-    say "    $cwd no longer exists; leaving $name alone"
-    return 1
-  fi
-  return 0
-}
-
-resume_session() {
-  local id="$1" sid="$2" cwd="$3" name="$4" out newid
-  local -a flags=()
-  if [ -n "${5:-}" ] && [ -s "$5" ]; then
-    mapfile -d '' -t flags < "$5"
-  else
-    python3 -c "$PY_FLAGS" "$JOBS/$id/state.json" > "$WORKFILE" 2>>"$LOG" || return 1
-    mapfile -d '' -t flags < "$WORKFILE"
-  fi
-  [ "${#flags[@]}" -gt 0 ] || return 1
-  local since; since="$(date +%s)"
-  out="$(cd "$cwd" || exit 1; \
-         DISABLE_AUTOUPDATER=1 timeout "$INSTALL_TIMEOUT" \
-           "$CLAUDE" --background --resume "$sid" "${flags[@]}" 2>&1 </dev/null)"
-  newid="$(printf '%s' "$out" | sed 's/\x1b\[[0-9;]*m//g' \
-           | awk '/backgrounded/{for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) {print $i; exit}}')"
-  if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
-    # Failing to read the announcement is not evidence that no session started,
-    # and recording a live session as failed makes the retry fork a second copy.
-    newid="$(agents_json </dev/null | python3 -c "$PY_FIND_NEW" "$cwd" "$name" "$since")"
-  fi
-  if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
-    printf '%s\n' "$out" >>"$LOG"
-    return 1
-  fi
-  say "    resumed as $newid"
-  python3 -c "$PY_MOVE_PIN" "$JOBS" "$id" "$newid" 2>>"$LOG" \
-    || say "    WARNING: $name resumed as $newid but its pin could not be moved; see $LOG"
-  return 0
-}
-
-# Sessions an earlier pass stopped but could not bring back are not in the live
-# list, so nothing else rediscovers them.
-retry_failed() {
-  [ "$DRY" -eq 1 ] && return 0
-  [ -r "$STATE" ] || return 0
-  local rows id sid cwd name
-  rows="$(python3 -c "$PY_STATE" "$STATE" read)" || return 0
-  [ -z "$rows" ] && return 0
-  while IFS=$'\x1f' read -r id sid cwd name; do
-    [ -z "${sid:-}" ] && continue
-    say "retrying $name, stopped by an earlier pass and never resumed"
-    python3 -c "$PY_STATE" "$STATE" flags "$id" > "$FLAGFILE" 2>/dev/null
-    if resume_session "$id" "$sid" "$cwd" "$name" "$FLAGFILE"; then
-      # Dropped immediately: a later exit path may never rewrite the state file,
-      # and a record left behind forks another live copy every hour.
-      python3 -c "$PY_STATE" "$STATE" drop "$id"
-      say "  recovered $name"
-    else
-      say "  still cannot resume $name; it stays recorded"
-    fi
-  done <<< "$rows"
-}
-retry_failed
-if [ "$DRY" -eq 0 ]; then
-  repair_pins apply >>"$LOG" 2>&1 || true
-fi
-
 new_version="$(installed_version)"
 if ! bin_mtime="$(stat -c %Y "$EXE" 2>/dev/null)"; then
   # A zero cutoff makes every session look current, which reads as a finished
@@ -589,28 +606,38 @@ while IFS=$'\x1f' read -r -d '' id sid cwd name; do
   [ "$skip" -eq 1 ] && continue
 
   say "  $name ($id): idle — restarting onto $new_version"
-  if ! restart_possible "$id" "$cwd" "$name"; then
+  if ! restart_possible "$id" "$cwd" "$name" "$sid"; then
     pending="$pending $id"
     continue
   fi
   python3 -c "$PY_STATE" "$STATE" record "$id" "$sid" "$cwd" "$name"
-  if ! run_claude stop "$id" >>"$LOG" 2>&1 </dev/null; then
-    # A stop that timed out may still have stopped the session; resuming one
-    # that is genuinely still running would leave two live copies.
-    if agents_json </dev/null | python3 -c "$PY_STATUS" "$id" | grep -q '^gone$'; then
-      log "    stop reported failure for $name but the session is gone; continuing"
+  run_claude stop "$id" >>"$LOG" 2>&1 </dev/null || true
+  # `claude stop` returning 0 means the daemon accepted the stop, not that the
+  # session has finished; resuming one that is still running leaves two live
+  # copies of the same conversation acting on the same directory.
+  gone=unknown
+  for _ in $(seq 1 8); do
+    if st="$(agents_json </dev/null | python3 -c "$PY_STATUS" "$id" 2>/dev/null)"; then
+      [ "$st" = gone ] && { gone=yes; break; }
+      gone=no
     else
-      say "    stop failed for $name; leaving it alone"
-      python3 -c "$PY_STATE" "$STATE" drop "$id"
-      pending="$pending $id"
-      continue
+      gone=unknown
     fi
-  fi
-  sleep 3
-  for _ in 1 2 3 4 5; do
-    agents_json </dev/null | python3 -c "$PY_STATUS" "$id" | grep -q '^gone$' && break
     sleep 2
   done
+  if [ "$gone" = no ]; then
+    say "    $name is still running after the stop; leaving it alone"
+    python3 -c "$PY_STATE" "$STATE" drop "$id"
+    pending="$pending $id"
+    continue
+  fi
+  if [ "$gone" = unknown ]; then
+    # Its state is genuinely unknown, so the record stays: retry_failed checks
+    # for a live copy before resuming, which is the safe way to settle it.
+    say "    cannot confirm $name stopped; leaving it recorded"
+    failed="$failed $id"
+    continue
+  fi
   if resume_session "$id" "$sid" "$cwd" "$name"; then
     python3 -c "$PY_STATE" "$STATE" drop "$id"
     continue
