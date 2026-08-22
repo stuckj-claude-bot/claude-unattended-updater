@@ -102,19 +102,23 @@ for s in d:
     if started<cut:
         sys.stdout.write("\x1f".join([str(s.get("id")),str(s.get("sessionId")),str(s.get("cwd")),str(s.get("name"))])+"\0")
 '
-# Prints the live job resumed from $1, if any. Fails when the session list
-# cannot be read, so callers do not mistake that for "nothing is running".
-find_resumed_from() {
+# Prints a live job that accounts for $1 — the job itself if it never stopped,
+# or the one we resumed from it. Fails when the session list cannot be read, so
+# callers do not mistake that for "nothing is running".
+find_live_for() {
   local listing
   listing="$(agents_json </dev/null)" || return 2
   printf '%s' "$listing" | python3 -c '
 import json, os, sys
 jobs, old = sys.argv[1], sys.argv[2]
 for x in json.load(sys.stdin):
-    marker = os.path.join(jobs, str(x.get("id")), ".updater-pin-source")
+    ident = str(x.get("id"))
+    if ident == old:
+        print(ident); break
+    marker = os.path.join(jobs, ident, ".updater-pin-source")
     try:
         if open(marker).read().strip() == old:
-            print(x.get("id")); break
+            print(ident); break
     except OSError:
         pass
 ' "$JOBS" "$1"
@@ -379,7 +383,9 @@ sys.exit(1 if unrepaired else 0)
 PY
 }
 
-exec 9>"$CLAUDE_DIR/.unattended-update.lock"
+if ! exec 9>"$CLAUDE_DIR/.unattended-update.lock"; then
+  say "cannot open the lock file under $CLAUDE_DIR"; exit 1
+fi
 if ! flock -n 9; then
   say "another run holds the lock; exiting"; exit 0
 fi
@@ -411,6 +417,8 @@ restart_possible() {
   return 0
 }
 
+# Resume $sid, replaying the job's respawnFlags, and carry the pin to the job
+# id the resume mints. Prints nothing on success beyond the new id.
 resume_session() {
   local id="$1" sid="$2" cwd="$3" name="$4" out newid
   local -a flags=()
@@ -452,7 +460,7 @@ retry_failed() {
   [ -z "$rows" ] && return 0
   while IFS=$'\x1f' read -r id sid cwd name; do
     [ -z "${sid:-}" ] && continue
-    live_id="$(find_resumed_from "$id")"; rc=$?
+    live_id="$(find_live_for "$id")"; rc=$?
     if [ "$rc" -ne 0 ]; then
       say "  cannot read the session list; leaving $name recorded"
       continue
@@ -460,7 +468,7 @@ retry_failed() {
     if [ -n "$live_id" ]; then
       # A pass killed between the resume and dropping the record would
       # otherwise fork a second agent on the same conversation.
-      say "  $name is already running as $live_id; clearing its record"
+      say "  $name is accounted for by live job $live_id; clearing its record"
       python3 -c "$PY_STATE" "$STATE" drop "$id"
       continue
     fi
@@ -551,8 +559,6 @@ else
 fi
 
 
-# Resume $sid, replaying the job's respawnFlags, and carry the pin to the job
-# id the resume mints. Prints nothing on success beyond the new id.
 # Resuming without --permission-mode or --model would strand an unattended
 # session at its first prompt and leave it unfindable by name, and resuming into
 # the wrong directory silently reroutes every relative path the agent uses.
@@ -657,26 +663,15 @@ while IFS=$'\x1f' read -r -d '' id sid cwd name; do
     fi
     sleep 2
   done
-  if [ "$gone" = no ] && [ "$stop_rc" -ne 0 ]; then
-    say "    $name is still running and the stop was refused; leaving it alone"
-    python3 -c "$PY_STATE" "$STATE" drop "$id"
-    pending="$pending $id"
-    continue
-  fi
-  if [ "$gone" = no ]; then
-    # The daemon accepted the stop, so this is a slow teardown rather than a
-    # refusal; the record stays and retry_failed settles it.
-    say "    $name accepted the stop but has not gone yet; leaving it recorded"
+  if [ "$gone" != yes ]; then
+    # Whether it is winding down slowly or the list was unreadable, the record
+    # stays: retry_failed asks whether the session is accounted for before it
+    # resumes anything, which is the only safe way to settle this.
+    say "    cannot confirm $name stopped (stop exit $stop_rc); leaving it recorded"
     failed="$failed $id"
     continue
   fi
-  if [ "$gone" = unknown ]; then
-    # Its state is genuinely unknown, so the record stays: retry_failed checks
-    # for a live copy before resuming, which is the safe way to settle it.
-    say "    cannot confirm $name stopped; leaving it recorded"
-    failed="$failed $id"
-    continue
-  fi
+
   if resume_session "$id" "$sid" "$cwd" "$name"; then
     python3 -c "$PY_STATE" "$STATE" drop "$id"
     continue
