@@ -1,0 +1,17 @@
+Origin: claude-unattended-updater
+Label: claude-unattended-updater
+Suite: stable
+Codename: stable
+Architectures: amd64 arm64 armhf i386
+Components: main
+Description: claude-unattended-updater APT repository
+Date: Sat, 22 Aug 2026 04:30:59 +0000
+SHA256:
+ 553fe2dca6119166d6633387b8ad79e1ddd7ff57a39d82c6efdb2b303fa7cc28 741 main/binary-amd64/Packages
+ afb5ace0c07f38d76eb248ac35c1e4643adc9e46cb33d7def0a4509131d94d17 488 main/binary-amd64/Packages.gz
+ 553fe2dca6119166d6633387b8ad79e1ddd7ff57a39d82c6efdb2b303fa7cc28 741 main/binary-arm64/Packages
+ afb5ace0c07f38d76eb248ac35c1e4643adc9e46cb33d7def0a4509131d94d17 488 main/binary-arm64/Packages.gz
+ 553fe2dca6119166d6633387b8ad79e1ddd7ff57a39d82c6efdb2b303fa7cc28 741 main/binary-armhf/Packages
+ afb5ace0c07f38d76eb248ac35c1e4643adc9e46cb33d7def0a4509131d94d17 488 main/binary-armhf/Packages.gz
+ 553fe2dca6119166d6633387b8ad79e1ddd7ff57a39d82c6efdb2b303fa7cc28 741 main/binary-i386/Packages
+ afb5ace0c07f38d76eb248ac35c1e4643adc9e46cb33d7def0a4509131d94d17 488 main/binary-i386/Packages.gz

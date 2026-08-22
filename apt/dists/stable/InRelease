@@ -1,0 +1,36 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: claude-unattended-updater
+Label: claude-unattended-updater
+Suite: stable
+Codename: stable
+Architectures: amd64 arm64 armhf i386
+Components: main
+Description: claude-unattended-updater APT repository
+Date: Sat, 22 Aug 2026 04:30:59 +0000
+SHA256:
+ 553fe2dca6119166d6633387b8ad79e1ddd7ff57a39d82c6efdb2b303fa7cc28 741 main/binary-amd64/Packages
+ afb5ace0c07f38d76eb248ac35c1e4643adc9e46cb33d7def0a4509131d94d17 488 main/binary-amd64/Packages.gz
+ 553fe2dca6119166d6633387b8ad79e1ddd7ff57a39d82c6efdb2b303fa7cc28 741 main/binary-arm64/Packages
+ afb5ace0c07f38d76eb248ac35c1e4643adc9e46cb33d7def0a4509131d94d17 488 main/binary-arm64/Packages.gz
+ 553fe2dca6119166d6633387b8ad79e1ddd7ff57a39d82c6efdb2b303fa7cc28 741 main/binary-armhf/Packages
+ afb5ace0c07f38d76eb248ac35c1e4643adc9e46cb33d7def0a4509131d94d17 488 main/binary-armhf/Packages.gz
+ 553fe2dca6119166d6633387b8ad79e1ddd7ff57a39d82c6efdb2b303fa7cc28 741 main/binary-i386/Packages
+ afb5ace0c07f38d76eb248ac35c1e4643adc9e46cb33d7def0a4509131d94d17 488 main/binary-i386/Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCgAdFiEELQLzZy4TTPePyFzKHtaDaWLdebgFAmqJJgQACgkQHtaDaWLd
+ebg0CBAApmhWxhRl84TLCXIs/nHFYqAiYPNdtHQKWRlzwMGGlPg/tcPiAcscxeWu
+e3WEyagC1t973IG/2S3+sTLQ9ecwhGBvAUsroVq08kFX7qkSrM9m5q326/AXgvxD
+BEzFRxTlmaGrHPi/V9CCQpLqOPzmBeseEvePwZUzW1cJ1CQQw2gMQkosWGW1hY7f
+uxWIDP8m4P7yUHO5gfYUDKdWpfJBwQNcG+4EJRYL1hk2U76e9BQzliE3o/rktxyT
+PvOL2sEGUuPlrvcv6kjG30cWhR4eaYjl4dGK61Z4OVCYmI6HQbT3K8j+e8tsYgPG
+KbTuScx7ooXKTjntQiEP26yOpSvelEmwMlN/o1fvq8gzx5SL198ZWEdGuYzXb4WX
++UdT1Vlrm1zzWob9zxd/hX61HXjmyM/RyeIOZv/Y2Z8ldaDEhAMKhYGB9t6OApHw
+2i/z5vITWnHa9a7pFvlQzqBN1lfuSP028dnd1FE2LwzvqvsOrBVyE/jIrgJJQtJ7
+gZgkBkAY+mXf/bCBh5/fBK95vbJrB9Q1buVdWjHUG8nQAdyg6gzsXxrIMvIcN0BD
+NbXQ3MSWcumV/eEQU1AWoBSBINauaCMp9f/FXR1jO8bJANmcg2z4VUgmgnWLhs1n
+AG5fXzAIRz+PRt/s4QV92TLJ/DKFLX5MGNn493gpJ92Yfl2t6F4=
+=wUUN
+-----END PGP SIGNATURE-----

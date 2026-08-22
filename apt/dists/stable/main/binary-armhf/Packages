@@ -1,0 +1,19 @@
+Package: claude-unattended-updater
+Version: 0.1.1
+Architecture: all
+Maintainer: stuckj <stuckj@users.noreply.github.com>
+Installed-Size: 32
+Depends: bash, python3
+Recommends: curl
+Filename: pool/main/claude-unattended-updater_0.1.1_all.deb
+Size: 13632
+MD5sum: 627a3e059e9c24db5011ed3084d2abfc
+SHA1: f8c363529723ae52aa4e5048e799c063da3f3ce2
+SHA256: ceb1bc7c2fabd928e2d8424174bc5e47a63cd5e2d3bd5e893b352e903e8271f0
+Section: utils
+Priority: optional
+Homepage: https://github.com/stuckj/claude-unattended-updater
+Description: Apply Claude Code updates without killing work in progress.
+ Checks for a new release, installs it, then restarts each Claude Code session
+ only once that session is genuinely idle, carrying its pin to the new job id.
+
