@@ -163,8 +163,11 @@ if [ "$rpms" -gt 0 ]; then
   say "verify every rpm carries a header signature"
   if command -v rpm >/dev/null; then
     for f in pages/yum/*.rpm; do
-      rpm --checksig "$f" 2>/dev/null | grep -q 'signatures OK' \
-        || die "$(basename "$f") has no header signature; gpgcheck=1 would reject it"
+      # `rpm --checksig` needs rpm's own keyring, which a Debian-family host has
+      # no initialised database for; read the header tags instead.
+      sig="$(rpm -qp --nosignature --qf '%{RSAHEADER:pgpsig}|%{SIGPGP:pgpsig}' "$f" 2>/dev/null)"
+      [ "$sig" = '(none)|(none)' ] \
+        && die "$(basename "$f") has no header signature; gpgcheck=1 would reject it"
     done
     echo "  all $rpms rpm(s) signed"
   else

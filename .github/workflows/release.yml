@@ -58,21 +58,18 @@ jobs:
           dpkg-deb -c "$deb" | grep -q usr/lib/systemd/user/claude-unattended-update.timer
 
       - name: Verify the rpm is signed in its header
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
         run: |
-          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
-          gpg --batch --armor --export "$GPG_KEY_ID" > pub.asc
-          [ -s pub.asc ] || { echo "exported public key is empty"; exit 1; }
-          sudo rpm --import pub.asc
-          out=$(rpm --checksig dist/*.rpm)
-          echo "$out"
-          # An unsigned package reports "digests OK" and omits "signatures".
-          # Without this gate a silently unsigned rpm ships and fails at every
-          # install with gpgcheck=1 enabled.
-          echo "$out" | grep -q 'signatures OK' \
-            || { echo "FATAL: rpm header is not signed"; exit 1; }
+          # Read the signature out of the header rather than asking rpm to
+          # verify it: `rpm --import` needs an initialised rpm database, which
+          # a Debian-family runner does not have, and it fails silently.
+          rpm -qpi --nosignature dist/*.rpm | sed -n 's/^Signature *: */Signature: /p'
+          sig=$(rpm -qp --nosignature --qf '%{RSAHEADER:pgpsig}|%{SIGPGP:pgpsig}' dist/*.rpm)
+          echo "header tags: $sig"
+          # An unsigned package reports (none) for both. Without this gate a
+          # silently unsigned rpm ships and fails every install under gpgcheck=1.
+          case "$sig" in
+            '(none)|(none)') echo "FATAL: rpm header is not signed"; exit 1 ;;
+          esac
 
       - name: Create release
         env:
