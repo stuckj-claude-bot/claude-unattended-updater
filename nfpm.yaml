@@ -1,0 +1,62 @@
+# nfpm configuration — see https://nfpm.goreleaser.com/configuration/
+# VERSION is supplied by the release workflow from the git tag.
+name: claude-unattended-updater
+arch: all
+platform: linux
+version: "${VERSION}"
+maintainer: stuckj <stuckj@users.noreply.github.com>
+description: |
+  Apply Claude Code updates without killing work in progress.
+  Checks for a new release, installs it, then restarts each Claude Code session
+  only once that session is genuinely idle, carrying its pin to the new job id.
+vendor: stuckj
+homepage: https://github.com/stuckj/claude-unattended-updater
+license: MIT
+section: utils
+priority: optional
+
+depends:
+  - bash
+  - python3
+
+recommends:
+  - curl
+
+contents:
+  - src: bin/claude-unattended-update
+    dst: /usr/bin/claude-unattended-update
+    file_info:
+      mode: 0755
+
+  # User units, not system units: the updater drives one user's sessions and
+  # needs that user's ~/.claude. Enable with `systemctl --user enable --now`.
+  - src: systemd/claude-unattended-update.service
+    dst: /usr/lib/systemd/user/claude-unattended-update.service
+    file_info:
+      mode: 0644
+  - src: systemd/claude-unattended-update.timer
+    dst: /usr/lib/systemd/user/claude-unattended-update.timer
+    file_info:
+      mode: 0644
+
+  - src: README.md
+    dst: /usr/share/doc/claude-unattended-updater/README.md
+    file_info:
+      mode: 0644
+  - src: LICENSE
+    dst: /usr/share/doc/claude-unattended-updater/LICENSE
+    file_info:
+      mode: 0644
+
+# RPM packages carry their signature inside the package header. `gpgcheck=1`
+# checks that header, NOT the repository metadata signature — so an rpm that is
+# only covered by a signed repomd.xml installs nowhere. key_file must be the
+# armored SECRET key; the passphrase comes from $NFPM_RPM_PASSPHRASE.
+#
+# Nothing equivalent is needed for deb: APT chains trust from the signed
+# Release through Packages' SHA256 to each .deb, and does not check per-package
+# signatures at all.
+rpm:
+  signature:
+    key_file: ${GPG_KEY_FILE}
+    key_id: ${GPG_KEY_ID}

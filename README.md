@@ -20,8 +20,7 @@ point of driving Claude Code from a phone.
 
 One engine owns the whole sequence, so nothing races it:
 
-1. **Check** hourly for a new release. Nothing new, exit immediately — it is one
-   `npm view` call.
+1. **Check** hourly for a new release. Nothing new, exit immediately — it is one registry lookup.
 2. **Install** the new version and wait for it to land completely.
 3. **Find** sessions still running the old binary.
 4. **Restart** each one *only once it is genuinely idle*, then move its pin across.
@@ -32,22 +31,71 @@ and left for you to rediscover.
 
 ## Install
 
+### Debian / Ubuntu (APT)
+
+```bash
+curl -fsSL https://stuckj.github.io/claude-unattended-updater/gpg-key.asc \
+  | sudo tee /usr/share/keyrings/claude-unattended-updater.asc >/dev/null
+
+sudo tee /etc/apt/sources.list.d/claude-unattended-updater.sources >/dev/null <<'SRC'
+Types: deb
+URIs: https://stuckj.github.io/claude-unattended-updater/apt
+Suites: stable
+Components: main
+Signed-By: /usr/share/keyrings/claude-unattended-updater.asc
+SRC
+
+sudo apt update && sudo apt install claude-unattended-updater
+```
+
+The package installs the systemd **user** units; enable them for your own user,
+since the updater drives that user's sessions and needs their `~/.claude`:
+
+```bash
+systemctl --user enable --now claude-unattended-update.timer
+sudo loginctl enable-linger "$USER"   # so it runs while you are logged out
+```
+
+### Fedora / RHEL (YUM/DNF)
+
+```bash
+sudo tee /etc/yum.repos.d/claude-unattended-updater.repo >/dev/null <<'REPO'
+[claude-unattended-updater]
+name=claude-unattended-updater
+baseurl=https://stuckj.github.io/claude-unattended-updater/yum
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://stuckj.github.io/claude-unattended-updater/gpg-key.asc
+REPO
+
+sudo dnf install claude-unattended-updater
+```
+
+`gpgcheck=1` verifies a signature inside each package header, which the release
+workflow adds at build time and refuses to publish without.
+
+### From source
+
 ```bash
 git clone https://github.com/stuckj/claude-unattended-updater
 cd claude-unattended-updater
 ./install.sh
 ```
 
-Then turn off the built-in updater so this is the only thing swapping the binary:
+### Required for every install method: disable the built-in updater
+
+This tool only helps if it is the *only* thing swapping the binary:
 
 ```bash
 # ~/.claude/settings.json
 { "env": { "DISABLE_AUTOUPDATER": "1" } }
 ```
 
-Restart any long-lived `claude` process afterwards — `claude agents`, `claude
+Then restart every long-lived `claude` process — `claude agents`, `claude
 remote-control`, and your login shell. A process started before that setting was
-written keeps its old environment and will carry on updating behind your back.
+written keeps its old environment and carries on updating behind your back,
+which is the failure this tool exists to prevent.
 
 ## Usage
 
@@ -58,7 +106,12 @@ claude-unattended-update --force      # ignore "already up to date"
 claude-unattended-update --repair     # fix pins pointing at a dead session
 ```
 
-Pause it at any time by creating the inhibit file:
+Every pass also puts back any pin left pointing at a session that cannot be
+resumed, so `--repair` is only needed to inspect or to fix one by hand.
+
+Pause update runs at any time by creating the inhibit file — a pass already
+waiting for a session to go idle notices it too (`--repair` is a manual command
+and runs regardless):
 
 ```bash
 touch ~/.claude/no-auto-update
@@ -74,6 +127,24 @@ touch ~/.claude/no-auto-update
 | `UPDATER_TMUX_SOCKET` | unset | Keep the restarted daemon in this tmux socket |
 | `CLAUDE_BIN` | from `PATH` | Path to the `claude` wrapper |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code config directory |
+| `UPDATER_LOG` | `~/.claude/unattended-update.log` | Log file |
+| `UPDATER_TMUX_SESSION` | `daemon` | tmux session name, with `UPDATER_TMUX_SOCKET` |
+| `UPDATER_PASS_DEADLINE` | `43200` | Give up on the whole pass after this many seconds |
+| `UPDATER_CLAUDE_TIMEOUT` | `120` | Timeout for a single `claude` query |
+| `UPDATER_INSTALL_TIMEOUT` | `900` | Timeout for the install and for a session resume |
+
+A systemd **user** service does not inherit your login shell's environment, so
+exporting these from `~/.bashrc` has no effect on the timer. Set them on the
+unit instead:
+
+```bash
+systemctl --user edit claude-unattended-update.service
+# [Service]
+# Environment=UPDATER_DEADLINE=3600
+```
+
+Checking for a new version needs either `curl` or `npm` on `PATH`; with neither,
+the run exits non-zero rather than reporting success.
 
 ## What "idle" means
 
@@ -100,6 +171,11 @@ phantom pin to the job that really owns the transcript.
 - The supervisor's own mtime watch cannot be unsubscribed. Installing while all
   sessions are idle bounds the damage of a lost race, and the engine detects a
   dead supervisor and restarts it, but it cannot prevent the watch from firing.
+- Restarting a session leaves its previous job directory behind: `claude stop`
+  does not remove one, and job scratch lives under `~/.claude/jobs/<id>/tmp`.
+  Expect one orphaned directory per restarted session per release. Pruning them
+  is safe once the restarted session has been prompted at least once; pruning
+  earlier removes what `--repair` needs to put a pin back.
 - Restarting a session starts a fresh context window. It resumes the conversation,
   it does not preserve an in-flight turn — which is why it waits for idle.
 

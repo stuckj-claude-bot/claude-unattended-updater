@@ -37,3 +37,16 @@ every session was skipped.
 ## `claude logs <id>` is not scriptable
 
 It emits a raw ANSI terminal dump, not text. Use `claude agents --json` for state.
+
+## Two packaging traps that fail silently
+
+**`dpkg-scanpackages --arch` selects on the filename.** It matches `*_all.deb`
+and `*_<arch>.deb`, not the control file's `Architecture` field. Renaming a
+package asset away from nfpm's default produces empty indexes with every command
+still exiting 0. `scripts/build-package-repos.sh` fails loudly on an empty index
+for this reason — do not "fix" that guard by removing it.
+
+**An unsigned rpm is not a build error.** `rpm --checksig` reports `digests OK`
+for an unsigned package and `digests signatures OK` for a signed one; both exit
+0. Only the header signature satisfies `gpgcheck=1` — signing `repomd.xml` does
+not. The release workflow greps for `signatures OK` explicitly.
