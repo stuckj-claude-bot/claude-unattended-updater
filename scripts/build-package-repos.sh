@@ -25,7 +25,7 @@ PAGES_URL="${PAGES_URL:-https://${REPO%%/*}.github.io/${REPO##*/}}"
 KEY="${GPG_KEY_ID:?GPG_KEY_ID must be set}"
 SUITE="${SUITE:-stable}"
 LABEL="${LABEL:-claude-unattended-updater}"
-ARCHES="${ARCHES:-amd64 arm64 armhf i386}"
+ARCHES="${ARCHES:-amd64 arm64 armhf i386 ppc64el s390x riscv64}"
 export GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 
 # Defaulting to a dry run means inspecting the script locally, or typing the

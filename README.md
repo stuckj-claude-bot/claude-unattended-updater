@@ -20,7 +20,7 @@ point of driving Claude Code from a phone.
 
 One engine owns the whole sequence, so nothing races it:
 
-1. **Check** hourly for a new release. Nothing new, exit immediately — it is one registry lookup.
+1. **Check** hourly for a new release. Nothing new, exit quickly — a registry lookup, plus a pass over the pins.
 2. **Install** the new version and wait for it to land completely.
 3. **Find** sessions still running the old binary.
 4. **Restart** each one *only once it is genuinely idle*, then move its pin across.
@@ -106,8 +106,10 @@ claude-unattended-update --force      # ignore "already up to date"
 claude-unattended-update --repair     # fix pins pointing at a dead session
 ```
 
-Every pass also puts back any pin left pointing at a session that cannot be
-resumed, so `--repair` is only needed to inspect or to fix one by hand.
+Every pass puts back a pin the updater itself moved, when the session it moved
+it to turned out never to start. Repairing a pin it has no record of means
+guessing from the session's name and directory, so that is left to `--repair`,
+which a human runs deliberately.
 
 Pause update runs at any time by creating the inhibit file — a pass already
 waiting for a session to go idle notices it too. `--repair` and `--dry-run` are
