@@ -11,7 +11,7 @@
 # Unlike a project shipping large binaries, the packages here are a few
 # kilobytes, so gh-pages carries the whole pool rather than only the current
 # version. That keeps Filename resolution trivial — APT resolves it against the
-# sources.list root, which is the Pages site.
+# URIs value in the client stanza, which is the /apt subdirectory.
 #
 # Everything is built under .repobuild/ before anything is published, so a
 # failure while building leaves the live repositories untouched.

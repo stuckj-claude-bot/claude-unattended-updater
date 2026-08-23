@@ -111,7 +111,9 @@ A session the updater stopped that does not come back is recorded and retried on
 later passes. After `UPDATER_MAX_RETRIES` attempts it stops retrying and the run
 exits non-zero every pass, so the failure stays visible rather than being
 forgotten. `--forget <job-id>` clears that record once you have dealt with it —
-the id is in the message and in the log.
+the id is in the message and in the log. It also clears a session parked in
+`pending`, which is where one lands when its directory is gone or its recorded
+flags are unusable, and which nothing else clears.
 
 Every pass puts back a pin the updater itself moved, when the session it moved
 it to turned out never to start. Repairing a pin it has no record of means
@@ -136,6 +138,7 @@ touch ~/.claude/no-auto-update
 | `UPDATER_TMUX_SOCKET` | unset | Keep the restarted daemon in this tmux socket |
 | `CLAUDE_BIN` | from `PATH` | Path to the `claude` wrapper |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code config directory |
+| `NVM_DIR` | `~/.nvm` | Where to look for `nvm.sh`, so `claude` is on `PATH` |
 | `UPDATER_LOG` | `~/.claude/unattended-update.log` | Log file |
 | `UPDATER_TMUX_SESSION` | `daemon` | tmux session name, with `UPDATER_TMUX_SOCKET` |
 | `UPDATER_PASS_DEADLINE` | `43200` | Give up on the whole pass after this many seconds |
