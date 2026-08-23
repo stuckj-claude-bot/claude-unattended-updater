@@ -41,14 +41,16 @@ PASS_DEADLINE="${UPDATER_PASS_DEADLINE:-$((12*60*60))}"  # whole pass
 CLAUDE_TIMEOUT="${UPDATER_CLAUDE_TIMEOUT:-120}"
 MAX_RETRIES="${UPDATER_MAX_RETRIES:-3}"
 
-DRY=0; FORCE=0; REPAIR_ONLY=0
+DRY=0; FORCE=0; REPAIR_ONLY=0; FORGET_NEXT=0; FORGET_ID=""
 for a in "$@"; do
   case "$a" in
     --dry-run) DRY=1 ;;
     --force)   FORCE=1 ;;
     --repair)  REPAIR_ONLY=1 ;;
+    --forget)  FORGET_NEXT=1 ;;
     -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "unknown option: $a" >&2; exit 2 ;;
+    *) if [ "$FORGET_NEXT" -eq 1 ]; then FORGET_ID="$a"; FORGET_NEXT=0
+       else echo "unknown option: $a" >&2; exit 2; fi ;;
   esac
 done
 
@@ -127,15 +129,22 @@ for x in json.load(sys.stdin):
 
 PY_FIND_NEW='
 import json, sys
-cwd, name, since = sys.argv[1], sys.argv[2], float(sys.argv[3])
+# A background job present now and absent before the resume is the one the
+# resume minted. Comparing wall-clock start times instead would reject a session
+# the daemon stamped a moment early.
+before = set(sys.argv[1].split())
+best = None
 try: d = json.load(sys.stdin)
 except Exception: raise SystemExit
 for x in d:
     if x.get("kind") != "background": continue
-    if x.get("cwd") != cwd or x.get("name") != name: continue
-    ts = x.get("startedAt")
-    if isinstance(ts, (int, float)) and ts / 1000.0 >= since:
-        print(x.get("id")); break
+    ident = str(x.get("id"))
+    if ident in before: continue
+    ts = x.get("startedAt") or 0
+    if best is None or ts > best[1]:
+        best = (ident, ts)
+if best:
+    print(best[0])
 '
 PY_STATE='
 import json, os, sys, tempfile
@@ -159,6 +168,13 @@ if action == "record":
     d["failed"] = [f for f in d["failed"] if f.get("id") != ident]
     d["failed"].append({"id": ident, "sessionId": sid, "cwd": cwd,
                         "name": name, "respawnFlags": flags})
+elif action == "count-attempts":
+    for f in d["failed"]:
+        if f.get("id") == sys.argv[3]:
+            print(int(f.get("attempts") or 0)); break
+    else:
+        print(0)
+    raise SystemExit
 elif action == "attempt":
     for f in d["failed"]:
         if f.get("id") == sys.argv[3]:
@@ -201,10 +217,13 @@ PY_MOVE_PIN='
 import json, os, shutil, sys, tempfile
 JOBS, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
 p = os.path.join(JOBS, "pins.json")
+marker = os.path.join(JOBS, new, ".updater-pin-source")
 # Written even when the job was not pinned, so --repair can always tell a
-# resumed session from a pin orphaned by a reaped respawn.
-with open(os.path.join(JOBS, new, ".updater-pin-source"), "w") as fh:
-    fh.write(old + "\n")
+# resumed session from a pin orphaned by a reaped respawn. Never overwrite one:
+# a marker that already names a different job belongs to that job.
+if not os.path.exists(marker):
+    with open(marker, "w") as fh:
+        fh.write(old + "\n")
 try: pins = json.load(open(p))
 except Exception: raise SystemExit
 if old not in pins: raise SystemExit
@@ -333,6 +352,8 @@ while queue:
         src = open(marker).read().strip()
         if os.path.isdir(os.path.join(JOBS, src)) and src not in pins:
             print(f'  {job}: resumed from {src} and never prompted; restoring that pin')
+            if mode != "apply":
+                unrepaired = True
             if mode == "apply":
                 pins[pins.index(job)] = src
                 write_pins(pins)
@@ -403,9 +424,15 @@ if ! flock -n 9; then
   exit 0
 fi
 
+if [ -n "$FORGET_ID" ]; then
+  python3 -c "$PY_STATE" "$STATE" drop "$FORGET_ID"
+  say "forgot the failure record for $FORGET_ID"
+  exit 0
+fi
+
 if [ "$REPAIR_ONLY" -eq 1 ]; then
   say "repairing phantom pins..."
-  repair_pins "$([ "$DRY" -eq 1 ] && echo report || echo apply)" all
+  repair_pins "$([ "$DRY" -eq 1 ] && echo report || echo apply)" all | tee -a "$LOG"
   exit $?
 fi
 
@@ -414,9 +441,9 @@ fi
 
 
 
-# Resuming without --permission-mode or --model would strand an unattended
-# session at its first prompt and leave it unfindable by name, and resuming into
-# the wrong directory silently reroutes every relative path the agent uses.
+# A session with no replayable flags, no directory, or no session id cannot be
+# brought back as it was, and resuming into the wrong directory silently
+# reroutes every relative path the agent uses.
 restart_possible() {
   local id="$1" cwd="$2" name="$3"  # $4 = session id
   if ! python3 -c "$PY_FLAGS" "$JOBS/$id/state.json" >/dev/null 2>>"$LOG"; then
@@ -445,7 +472,8 @@ resume_session() {
     mapfile -d '' -t flags < "$WORKFILE"
   fi
   [ "${#flags[@]}" -gt 0 ] || return 1
-  local since; since="$(date +%s)"
+  local before
+  before="$(agents_json </dev/null | python3 -c 'import json,sys;print(" ".join(str(x.get("id")) for x in json.load(sys.stdin)))' 2>/dev/null)" || before=""
   out="$(cd "$cwd" || exit 1; \
          DISABLE_AUTOUPDATER=1 timeout "$INSTALL_TIMEOUT" \
            "$CLAUDE" --background --resume "$sid" "${flags[@]}" 2>&1 </dev/null)"
@@ -454,7 +482,7 @@ resume_session() {
   if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
     # Failing to read the announcement is not evidence that no session started,
     # and recording a live session as failed makes the retry fork a second copy.
-    newid="$(agents_json </dev/null | python3 -c "$PY_FIND_NEW" "$cwd" "$name" "$since")"
+    newid="$(agents_json </dev/null | python3 -c "$PY_FIND_NEW" "$before")"
   fi
   if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
     printf '%s\n' "$out" >>"$LOG"
@@ -488,11 +516,13 @@ retry_failed() {
       python3 -c "$PY_STATE" "$STATE" drop "$id"
       continue
     fi
-    tries="$(python3 -c "$PY_STATE" "$STATE" attempt "$id")"
-    if [ "${tries:-1}" -gt "$MAX_RETRIES" ]; then
-      say "  $name has failed to resume $MAX_RETRIES times; leaving it recorded and not retrying"
+    tries="$(python3 -c "$PY_STATE" "$STATE" count-attempts "$id")"
+    if [ "${tries:-0}" -ge "$MAX_RETRIES" ]; then
+      say "  $name has failed to resume $MAX_RETRIES times; not retrying"
+      say "    clear it with: claude-unattended-update --forget $id"
       continue
     fi
+    tries="$(python3 -c "$PY_STATE" "$STATE" attempt "$id")"
     say "retrying $name, stopped by an earlier pass and never resumed (attempt $tries)"
     python3 -c "$PY_STATE" "$STATE" flags "$id" > "$FLAGFILE" 2>/dev/null
     if resume_session "$id" "$sid" "$cwd" "$name" "$FLAGFILE"; then

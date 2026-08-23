@@ -104,7 +104,14 @@ claude-unattended-update              # what the timer runs
 claude-unattended-update --dry-run    # report only, change nothing
 claude-unattended-update --force      # ignore "already up to date"
 claude-unattended-update --repair     # fix pins pointing at a dead session
+claude-unattended-update --forget ID  # drop a stuck failure record
 ```
+
+A session the updater stopped that does not come back is recorded and retried on
+later passes. After `UPDATER_MAX_RETRIES` attempts it stops retrying and the run
+exits non-zero every pass, so the failure stays visible rather than being
+forgotten. `--forget <job-id>` clears that record once you have dealt with it —
+the id is in the message and in the log.
 
 Every pass puts back a pin the updater itself moved, when the session it moved
 it to turned out never to start. Repairing a pin it has no record of means
@@ -134,6 +141,7 @@ touch ~/.claude/no-auto-update
 | `UPDATER_PASS_DEADLINE` | `43200` | Give up on the whole pass after this many seconds |
 | `UPDATER_CLAUDE_TIMEOUT` | `120` | Timeout for a single `claude` query |
 | `UPDATER_INSTALL_TIMEOUT` | `900` | Timeout for the install and for a session resume |
+| `UPDATER_MAX_RETRIES` | `3` | Resume attempts for a session that was stopped and did not come back |
 
 A systemd **user** service does not inherit your login shell's environment, so
 exporting these from `~/.bashrc` has no effect on the timer. Set them on the
