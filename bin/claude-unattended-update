@@ -186,8 +186,10 @@ elif action == "attempt":
         raise SystemExit
 elif action == "drop":
     kept = [f for f in d["failed"] if f.get("id") != sys.argv[3]]
-    print("dropped" if len(kept) != len(d["failed"]) else "absent")
-    d["failed"] = kept
+    keptp = [i for i in d["pending"] if i != sys.argv[3]]
+    print("dropped" if (len(kept) != len(d["failed"]) or len(keptp) != len(d["pending"]))
+          else "absent")
+    d["failed"], d["pending"] = kept, keptp
 elif action == "pending":
     d["rolloutVersion"] = sys.argv[3]
     d["pending"] = sys.argv[4:]
@@ -655,7 +657,11 @@ fi
 # becomes once a real install lands.
 [ "$DRY" -eq 1 ] && bin_mtime="$(date +%s)"
 
-sessions="$(agents_json)" || { say "could not read the session list; deferring"; exit 0; }
+if ! sessions="$(agents_json)"; then
+  say "could not read the session list; deferring"
+  [ "$(python3 -c "$PY_STATE" "$STATE" count-failed 2>/dev/null || echo 0)" -gt 0 ] && exit 1
+  exit 0
+fi
 if ! printf '%s' "$sessions" | python3 -c "$PY_STALE" "$bin_mtime" > "$STALEFILE" 2>>"$LOG"; then
   say "could not classify the session list; see $LOG"; exit 1
 fi
