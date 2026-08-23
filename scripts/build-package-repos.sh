@@ -100,7 +100,12 @@ with open(p, "w") as fh:
         fh.write(s + "\n\n")
 PY
     gzip -nkf "dists/$SUITE/main/binary-$a/Packages"   # -n: no mtime
-    echo "  $a: $(grep -c '^Package:' "dists/$SUITE/main/binary-$a/Packages") entries"
+    indexed="$(grep -c '^Package:' "dists/$SUITE/main/binary-$a/Packages")"
+    # Every package here is Architecture: all, so each arch index must list all
+    # of them; a short count means an asset's filename did not match.
+    [ "$indexed" -eq "$debs" ] \
+      || die "$SUITE/$a indexed $indexed of $debs packages — check the asset filenames"
+    echo "  $a: $indexed entries"
   done
 
   ( cd "dists/$SUITE"

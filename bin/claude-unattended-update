@@ -39,6 +39,7 @@ DEADLINE="${UPDATER_DEADLINE:-$((6*60*60))}"       # per session
 INSTALL_TIMEOUT="${UPDATER_INSTALL_TIMEOUT:-900}"
 PASS_DEADLINE="${UPDATER_PASS_DEADLINE:-$((12*60*60))}"  # whole pass
 CLAUDE_TIMEOUT="${UPDATER_CLAUDE_TIMEOUT:-120}"
+MAX_RETRIES="${UPDATER_MAX_RETRIES:-3}"
 
 DRY=0; FORCE=0; REPAIR_ONLY=0
 for a in "$@"; do
@@ -158,6 +159,14 @@ if action == "record":
     d["failed"] = [f for f in d["failed"] if f.get("id") != ident]
     d["failed"].append({"id": ident, "sessionId": sid, "cwd": cwd,
                         "name": name, "respawnFlags": flags})
+elif action == "attempt":
+    for f in d["failed"]:
+        if f.get("id") == sys.argv[3]:
+            f["attempts"] = int(f.get("attempts") or 0) + 1
+            print(f["attempts"])
+            break
+    else:
+        raise SystemExit
 elif action == "drop":
     d["failed"] = [f for f in d["failed"] if f.get("id") != sys.argv[3]]
 elif action == "pending":
@@ -171,7 +180,8 @@ elif action == "read":
 elif action == "flags":
     for f in d["failed"]:
         if f.get("id") == sys.argv[3]:
-            sys.stdout.write("\0".join(f.get("respawnFlags") or []))
+            sys.stdout.write("\0".join(
+                x for x in (f.get("respawnFlags") or []) if x != "--reply-on-resume"))
             break
     raise SystemExit
 elif action == "count":
@@ -215,7 +225,7 @@ print(f"    pin moved {old} -> {new}")
 PY_FLAGS='
 import json, sys
 d = json.load(open(sys.argv[1]))
-flags = d.get("respawnFlags") or []
+flags = [f for f in (d.get("respawnFlags") or []) if f != "--reply-on-resume"]
 if not flags:
     sys.exit(1)
 sys.stdout.write("\0".join(flags))
@@ -356,13 +366,14 @@ while queue:
     if not cands:
         print("    no replacement found — needs a human"); unrepaired = True; continue
     cands.sort(key=lambda c: c[3], reverse=True)
-    if len(cands) > 1 and cands[0][3] == cands[1][3]:
+    if len(cands) > 1 and cands[0][3] - cands[1][3] < 60:
         names = ", ".join(sorted(c[0] for c in cands))
-        print(f"    ambiguous: {names} share a timestamp — refusing to guess")
+        print(f"    ambiguous: {names} were active within a minute — refusing to guess")
         unrepaired = True; continue
     other, osid, size, _ = cands[0]
     print(f"    -> job {other} owns {osid} ({size/1e6:.1f}MB)")
     if mode != "apply":
+        unrepaired = True
         continue
     pins[pins.index(job)] = other
     write_pins(pins)
@@ -387,7 +398,9 @@ if ! exec 9>"$CLAUDE_DIR/.unattended-update.lock"; then
   say "cannot open the lock file under $CLAUDE_DIR"; exit 1
 fi
 if ! flock -n 9; then
-  say "another run holds the lock; exiting"; exit 0
+  say "another run holds the lock; exiting"
+  [ "$REPAIR_ONLY" -eq 1 ] && exit 1
+  exit 0
 fi
 
 if [ "$REPAIR_ONLY" -eq 1 ]; then
@@ -401,6 +414,9 @@ fi
 
 
 
+# Resuming without --permission-mode or --model would strand an unattended
+# session at its first prompt and leave it unfindable by name, and resuming into
+# the wrong directory silently reroutes every relative path the agent uses.
 restart_possible() {
   local id="$1" cwd="$2" name="$3"  # $4 = session id
   if ! python3 -c "$PY_FLAGS" "$JOBS/$id/state.json" >/dev/null 2>>"$LOG"; then
@@ -472,7 +488,12 @@ retry_failed() {
       python3 -c "$PY_STATE" "$STATE" drop "$id"
       continue
     fi
-    say "retrying $name, stopped by an earlier pass and never resumed"
+    tries="$(python3 -c "$PY_STATE" "$STATE" attempt "$id")"
+    if [ "${tries:-1}" -gt "$MAX_RETRIES" ]; then
+      say "  $name has failed to resume $MAX_RETRIES times; leaving it recorded and not retrying"
+      continue
+    fi
+    say "retrying $name, stopped by an earlier pass and never resumed (attempt $tries)"
     python3 -c "$PY_STATE" "$STATE" flags "$id" > "$FLAGFILE" 2>/dev/null
     if resume_session "$id" "$sid" "$cwd" "$name" "$FLAGFILE"; then
       # Dropped immediately: a later exit path may never rewrite the state file,
@@ -484,6 +505,7 @@ retry_failed() {
     fi
   done <<< "$rows"
 }
+pass_start=$SECONDS
 if [ "$DRY" -eq 0 ]; then
   # Markers only: the candidate search guesses from name and cwd, which is fine
   # under a human running --repair and not fine running unattended every hour.
@@ -520,7 +542,7 @@ else
     say "DRY RUN: would install $want now"
   else
     say "installing $want ..."
-    env -u DISABLE_AUTOUPDATER timeout "$INSTALL_TIMEOUT" "$CLAUDE" update >>"$LOG" 2>&1 \
+    env -u DISABLE_AUTOUPDATER timeout "$INSTALL_TIMEOUT" "$CLAUDE" update >>"$LOG" 2>&1 </dev/null \
       || say "installer exited non-zero; see $LOG"
     got="$(installed_version)"
     if [ "$got" != "$want" ]; then
@@ -559,9 +581,6 @@ else
 fi
 
 
-# Resuming without --permission-mode or --model would strand an unattended
-# session at its first prompt and leave it unfindable by name, and resuming into
-# the wrong directory silently reroutes every relative path the agent uses.
 [ "$DRY" -eq 0 ] && retry_failed
 
 new_version="$(installed_version)"
@@ -602,7 +621,7 @@ if [ "$DRY" -eq 1 ]; then
   exit 0
 fi
 
-pending=""; failed=""; pass_start=$SECONDS
+pending=""; failed=""
 while IFS=$'\x1f' read -r -d '' id sid cwd name; do
   [ -z "${id:-}" ] && continue
   # Sessions are handled in order, so a busy one holds up those behind it;

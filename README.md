@@ -180,6 +180,10 @@ phantom pin to the job that really owns the transcript.
   earlier removes what `--repair` needs to put a pin back.
 - Restarting a session starts a fresh context window. It resumes the conversation,
   it does not preserve an in-flight turn — which is why it waits for idle.
+- A session's own launch flags are replayed so it comes back configured as it
+  was, with one exception: `--reply-on-resume` is dropped. That flag makes a
+  session take a turn the moment it is resumed, and a restart for an update has
+  to be inert.
 
 ## License
 

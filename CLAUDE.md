@@ -38,6 +38,15 @@ every session was skipped.
 
 It emits a raw ANSI terminal dump, not text. Use `claude agents --json` for state.
 
+## `--reply-on-resume` makes a resume take a turn
+
+`claude --background --resume` injects no prompt, so a resumed session comes back
+idle — unless its `respawnFlags` carry `--reply-on-resume`, which makes it start
+a turn immediately. Several real jobs on a working box carry it. The updater
+filters that flag out of the ones it replays; do not "restore" it for fidelity,
+or an unattended restart will begin work under whatever `--permission-mode` the
+session had.
+
 ## Two packaging traps that fail silently
 
 **`dpkg-scanpackages --arch` selects on the filename.** It matches `*_all.deb`
