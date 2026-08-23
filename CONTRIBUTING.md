@@ -3,6 +3,7 @@
 ## Before you push
 
 ```bash
+tests/repair-scenarios.sh                 # pin repair, against throwaway fixtures
 bash -n bin/claude-unattended-update      # syntax
 shellcheck -S warning bin/claude-unattended-update
 ./bin/claude-unattended-update --dry-run --force   # exercises detection, changes nothing

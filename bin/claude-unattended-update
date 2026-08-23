@@ -299,13 +299,17 @@ repair_pins() {
   # which is indistinguishable from a phantom pin on disk alone. Liveness tells
   # them apart, so without a readable session list this refuses to act.
   local live
-  live="$(agents_json | python3 -c 'import json,sys;print(" ".join(str(s.get("id")) for s in json.load(sys.stdin)))' 2>/dev/null)" \
+  live="$(agents_json | python3 -c 'import json,sys;print(" ".join(str(s.get("id"))+":"+str(s.get("startedAt")) for s in json.load(sys.stdin)))' 2>/dev/null)" \
     || { say "  cannot read the session list; refusing to repair"; return 1; }
   python3 - "$JOBS" "$PROJECTS" "${1:-report}" "$live" "${2:-all}" <<'PY'
 import json, glob, os, shutil, sys, tempfile
 JOBS, PROJ, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 scope = sys.argv[5] if len(sys.argv) > 5 else "all"
-live = set((sys.argv[4] if len(sys.argv) > 4 else "").split())
+# id -> start time of the process the daemon currently has for that job.
+live = {}
+for item in (sys.argv[4] if len(sys.argv) > 4 else "").split():
+    ident, _, started = item.partition(":")
+    live[ident] = started
 pins_path = os.path.join(JOBS, "pins.json")
 try:
     pins = json.load(open(pins_path))
@@ -346,15 +350,26 @@ while queue:
     sid = d.get("resumeSessionId") or d.get("sessionId")
     if transcript_for(sid):
         continue
-    if job in live:
-        # Running: its transcript appears when it is next prompted.
+    marker = os.path.join(JOBS, job, ".updater-pin-source")
+    src, started_at = "", ""
+    if os.path.exists(marker):
+        lines = open(marker).read().split("\n")
+        src = lines[0].strip()
+        for ln in lines[1:]:
+            if ln.startswith("startedAt="):
+                started_at = ln.split("=", 1)[1].strip()
+    if job in live and started_at and live[job] == started_at:
+        # Still the process we resumed: its transcript appears when prompted.
+        continue
+    if job in live and not started_at and not src:
+        # Nothing records that this tool resumed it, so leave it alone.
         continue
     found = True
-    marker = os.path.join(JOBS, job, ".updater-pin-source")
-    if os.path.exists(marker):
-        src = open(marker).read().strip()
+    if src:
         if os.path.isdir(os.path.join(JOBS, src)) and src not in pins:
-            print(f'  {job}: resumed from {src} and never prompted; restoring that pin')
+            why = ("was respawned, losing what it held"
+                   if job in live else "never started again")
+            print(f'  {job}: resumed from {src}, never prompted, and {why}; restoring that pin')
             if mode != "apply":
                 unrepaired = True
             if mode == "apply":
@@ -523,7 +538,7 @@ retry_failed() {
       # A pass killed between the resume and dropping the record would
       # otherwise fork a second agent on the same conversation.
       say "  $name is accounted for by live job $live_id; clearing its record"
-      python3 -c "$PY_STATE" "$STATE" drop "$id"
+      python3 -c "$PY_STATE" "$STATE" drop "$id" >/dev/null
       continue
     fi
     tries="$(python3 -c "$PY_STATE" "$STATE" count-attempts "$id")"
@@ -535,10 +550,16 @@ retry_failed() {
     tries="$(python3 -c "$PY_STATE" "$STATE" attempt "$id")"
     say "retrying $name, stopped by an earlier pass and never resumed (attempt $tries)"
     python3 -c "$PY_STATE" "$STATE" flags "$id" > "$FLAGFILE" 2>/dev/null
-    if resume_session "$id" "$sid" "$cwd" "$name" "$FLAGFILE"; then
+    resume_session "$id" "$sid" "$cwd" "$name" "$FLAGFILE"; rrc=$?
+    if [ "$rrc" -eq 2 ]; then
+      say "  $name came back but could not be identified; clearing its record"
+      python3 -c "$PY_STATE" "$STATE" drop "$id" >/dev/null
+      continue
+    fi
+    if [ "$rrc" -eq 0 ]; then
       # Dropped immediately: a later exit path may never rewrite the state file,
       # and a record left behind forks another live copy every hour.
-      python3 -c "$PY_STATE" "$STATE" drop "$id"
+      python3 -c "$PY_STATE" "$STATE" drop "$id" >/dev/null
       say "  recovered $name"
     else
       say "  still cannot resume $name; it stays recorded"
@@ -731,8 +752,17 @@ while IFS=$'\x1f' read -r -d '' id sid cwd name; do
     continue
   fi
 
-  if resume_session "$id" "$sid" "$cwd" "$name"; then
-    python3 -c "$PY_STATE" "$STATE" drop "$id"
+  resume_session "$id" "$sid" "$cwd" "$name"; rrc=$?
+  if [ "$rrc" -eq 0 ]; then
+    python3 -c "$PY_STATE" "$STATE" drop "$id" >/dev/null
+    continue
+  fi
+  if [ "$rrc" -eq 2 ]; then
+    # Running but unidentified: recording it would make the retry start a
+    # second agent on the same conversation.
+    say "    WARNING: $name came back but could not be identified; its pin was not moved"
+    python3 -c "$PY_STATE" "$STATE" drop "$id" >/dev/null
+    pending="$pending $id"
     continue
   fi
   # The stop succeeded, so this session is down and the live list will not

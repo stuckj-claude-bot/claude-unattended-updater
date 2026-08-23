@@ -38,6 +38,20 @@ every session was skipped.
 
 It emits a raw ANSI terminal dump, not text. Use `claude agents --json` for state.
 
+## `claude agents --json` is not a liveness list
+
+It reports every job the daemon has a process for, `state: done` included, and it
+keeps reporting a job after that process has been replaced. Treating presence in
+that listing as "this session is healthy" hides the case pin repair exists for: a
+resumed job holds its conversation only in the process the resume started, since
+its own `resumeSessionId` names a transcript that does not exist until the
+session is next prompted, and its `respawnFlags` carry no `--resume`. Respawn it
+— a reboot is enough — and the daemon lists a live job with nothing behind it.
+
+`startedAt` is per process and changes on respawn, so `.updater-pin-source`
+records it next to the source job id and repair compares the two. Do not
+simplify that back to a membership test.
+
 ## `--reply-on-resume` makes a resume take a turn
 
 `claude --background --resume` injects no prompt, so a resumed session comes back
