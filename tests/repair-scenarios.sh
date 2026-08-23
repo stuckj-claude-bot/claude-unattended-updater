@@ -13,10 +13,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 pass=0; fail=0
 
-# The tool compares the installed version against the npm registry; reporting
-# the same string from the fake keeps every case on the up-to-date path.
-VERSION="$("$BIN" --version 2>/dev/null || true)"
-[ -n "$VERSION" ] || VERSION="9.9.9"
+VERSION=9.9.9
 
 check() { # check <name> <expected> <actual>
   if [ "$2" = "$3" ]; then pass=$((pass+1)); printf '  ok    %s\n' "$1"
@@ -49,7 +46,10 @@ fixture() { # fixture <dir> <marker-content> <startedAt-in-listing>
   chmod +x "$f/fake/claude"
 }
 
-repair() { CLAUDE_BIN="$1/fake/claude" CLAUDE_CONFIG_DIR="$1" "$BIN" --repair >/dev/null 2>&1; }
+repair() { # exit status is part of what these cases assert
+  CLAUDE_BIN="$1/fake/claude" CLAUDE_CONFIG_DIR="$1" "$BIN" --repair >"$1/out" 2>&1
+  echo $? > "$1/rc"
+}
 pins()   { tr -d '\n ' < "$1/jobs/pins.json"; }
 
 echo "pin repair guard"
@@ -77,6 +77,65 @@ check "pinned job has its own transcript: no change" '["newjob00"]' "$(pins "$WO
 # The order file has to travel with the pin, or the pinned slot loses its place.
 fixture "$WORK/f" 'oldjob00\n' 1000; repair "$WORK/f"
 check "order file follows the pin" "yes" "$([ -f "$WORK/f/jobs/oldjob00/order" ] && echo yes || echo no)"
+
+# The cases above hand-write .updater-pin-source, so they cannot catch a marker
+# writer that disagrees with the reader. This one runs a real rollout through the
+# program and only then asks whether the pin survives.
+echo
+echo "rollout end to end"
+
+E="$WORK/e2e"
+mkdir -p "$E/jobs/oldjob00" "$E/projects/-h" "$E/fake" "$E/wd"
+printf '{"name":"s","cwd":"%s/wd","resumeSessionId":"sid-old","respawnFlags":["--model","opus"]}\n' "$E" \
+  > "$E/jobs/oldjob00/state.json"
+echo x > "$E/projects/-h/sid-old.jsonl"
+printf '["oldjob00"]' > "$E/jobs/pins.json"
+echo 5 > "$E/jobs/oldjob00/order"
+OLD_TS=1000
+NEW_TS=2000
+cat > "$E/fake/claude" <<FAKE
+#!/bin/bash
+case "\$1" in
+  --version) echo "$VERSION";;
+  agents)
+    if [ -f "$E/resumed" ]; then
+      echo '[{"id":"newjob00","sessionId":"sid-new","cwd":"$E/wd","name":"s","kind":"background","status":"idle","startedAt":$NEW_TS}]'
+    elif [ -f "$E/down" ]; then
+      echo '[]'
+    else
+      echo '[{"id":"oldjob00","sessionId":"sid-old","cwd":"$E/wd","name":"s","kind":"background","status":"idle","startedAt":$OLD_TS}]'
+    fi;;
+  stop) touch "$E/down"; exit 0;;
+  --background)
+    touch "$E/resumed"
+    mkdir -p "$E/jobs/newjob00"
+    printf '{"name":"s","cwd":"$E/wd","resumeSessionId":"sid-new","respawnFlags":["--model","opus"]}\\n' \\
+      > "$E/jobs/newjob00/state.json"
+    echo "backgrounded · newjob00 · s";;
+  *) echo "$VERSION";;
+esac
+FAKE
+chmod +x "$E/fake/claude"
+# latest_version reads the registry; a stub keeps the suite off the network.
+mkdir -p "$E/bin"
+cat > "$E/bin/curl" <<CURL
+#!/bin/bash
+printf '%s' '{"version":"$VERSION"}'
+CURL
+chmod +x "$E/bin/curl"
+
+PATH="$E/bin:$PATH" CLAUDE_BIN="$E/fake/claude" CLAUDE_CONFIG_DIR="$E" \
+  UPDATER_POLL=1 UPDATER_IDLE_STREAK=1 "$BIN" --force >"$E/out" 2>&1
+check "rollout moves the pin to the resumed job" '["newjob00"]' "$(tr -d '\n ' < "$E/jobs/pins.json")"
+check "marker names the source job" "oldjob00" \
+  "$(head -1 "$E/jobs/newjob00/.updater-pin-source" 2>/dev/null)"
+# Without this line the repair guard cannot tell a live resume from a respawn,
+# and every later pass hands the pin back to the job it stopped.
+check "marker records the resumed start time" "startedAt=$NEW_TS" \
+  "$(sed -n 2p "$E/jobs/newjob00/.updater-pin-source" 2>/dev/null)"
+
+PATH="$E/bin:$PATH" repair "$E"
+check "repair after a rollout leaves the pin alone" '["newjob00"]' "$(tr -d '\n ' < "$E/jobs/pins.json")"
 
 echo
 echo "$pass passed, $fail failed"

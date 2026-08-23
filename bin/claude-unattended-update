@@ -120,7 +120,7 @@ for x in json.load(sys.stdin):
         print(ident); break
     marker = os.path.join(jobs, ident, ".updater-pin-source")
     try:
-        if open(marker).read().strip() == old:
+        if open(marker).read().split("\n")[0].strip() == old:
             print(ident); break
     except OSError:
         pass
@@ -164,9 +164,11 @@ if action == "record":
                                             "state.json"))).get("respawnFlags") or []
     except Exception:
         pass
+    prior = next((f for f in d["failed"] if f.get("id") == ident), None)
     d["failed"] = [f for f in d["failed"] if f.get("id") != ident]
     d["failed"].append({"id": ident, "sessionId": sid, "cwd": cwd,
-                        "name": name, "respawnFlags": flags})
+                        "name": name, "respawnFlags": flags,
+                        "attempts": int((prior or {}).get("attempts") or 0)})
 elif action == "count-failed":
     print(len(d["failed"])); raise SystemExit
 elif action == "count-attempts":
@@ -223,12 +225,15 @@ import json, os, shutil, sys, tempfile
 JOBS, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
 p = os.path.join(JOBS, "pins.json")
 marker = os.path.join(JOBS, new, ".updater-pin-source")
+started = sys.argv[4] if len(sys.argv) > 4 else ""
 # Written even when the job was not pinned, so --repair can always tell a
 # resumed session from a pin orphaned by a reaped respawn. Never overwrite one:
 # a marker that already names a different job belongs to that job.
 if not os.path.exists(marker):
     with open(marker, "w") as fh:
         fh.write(old + "\n")
+        if started:
+            fh.write("startedAt=" + started + "\n")
 try: pins = json.load(open(p))
 except Exception: raise SystemExit
 if old not in pins: raise SystemExit
@@ -488,7 +493,7 @@ restart_possible() {
 # Resume $sid, replaying the job's respawnFlags, and carry the pin to the job
 # id the resume mints. Prints nothing on success beyond the new id.
 resume_session() {
-  local id="$1" sid="$2" cwd="$3" name="$4" out newid
+  local id="$1" sid="$2" cwd="$3" name="$4" out newid rc=0 started
   local -a flags=()
   if [ -n "${5:-}" ] && [ -s "$5" ]; then
     mapfile -d '' -t flags < "$5"
@@ -501,7 +506,11 @@ resume_session() {
   before="$(agents_json </dev/null | python3 -c 'import json,sys;print(" ".join(str(x.get("id")) for x in json.load(sys.stdin)))' 2>/dev/null)" || before_ok=0
   out="$(cd "$cwd" || exit 1; \
          DISABLE_AUTOUPDATER=1 timeout "$INSTALL_TIMEOUT" \
-           "$CLAUDE" --background --resume "$sid" "${flags[@]}" 2>&1 </dev/null)"
+           "$CLAUDE" --background --resume "$sid" "${flags[@]}" 2>&1 </dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$out" >>"$LOG"
+    return 1
+  fi
   newid="$(printf '%s' "$out" | sed 's/\x1b\[[0-9;]*m//g' \
            | awk '/backgrounded/{for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) {print $i; exit}}')"
   if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
@@ -512,11 +521,22 @@ resume_session() {
     fi
   fi
   if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
+    # The resume itself succeeded, so a session is running; recording this as a
+    # failure would make the retry start a second copy of the conversation.
     printf '%s\n' "$out" >>"$LOG"
-    return 1
+    return 2
   fi
   say "    resumed as $newid"
-  python3 -c "$PY_MOVE_PIN" "$JOBS" "$id" "$newid" >>"$LOG" 2>&1 \
+  # The start time of the process now holding the conversation; repair uses it
+  # to tell this session from a later respawn of the same job.
+  started="$(agents_json </dev/null | python3 -c '
+import json, sys
+want = sys.argv[1]
+for x in json.load(sys.stdin):
+    if str(x.get("id")) == want:
+        print(x.get("startedAt")); break
+' "$newid" 2>/dev/null)" || started=""
+  python3 -c "$PY_MOVE_PIN" "$JOBS" "$id" "$newid" "$started" >>"$LOG" 2>&1 \
     || say "    WARNING: $name resumed as $newid but its pin could not be moved; see $LOG"
   return 0
 }
