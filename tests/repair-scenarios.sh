@@ -22,15 +22,15 @@ check() { # check <name> <expected> <actual>
 
 fixture() { # fixture <dir> <marker-content> <startedAt-in-listing>
   local f="$1" marker="$2" ts="$3"
-  rm -rf "$f"; mkdir -p "$f/jobs/oldjob00" "$f/jobs/newjob00" "$f/projects/-h" "$f/fake"
+  rm -rf "$f"; mkdir -p "$f/jobs/oldjob00" "$f/jobs/aa11bb22" "$f/projects/-h" "$f/fake"
   printf '{"name":"s","cwd":"/home/x","resumeSessionId":"sid-old"}\n' > "$f/jobs/oldjob00/state.json"
   printf '{"name":"s","cwd":"/home/x","resumeSessionId":"sid-new","respawnFlags":["--agent","claude"]}\n' \
-    > "$f/jobs/newjob00/state.json"
+    > "$f/jobs/aa11bb22/state.json"
   # Only the original job has a transcript; the resumed one never wrote hers.
   echo x > "$f/projects/-h/sid-old.jsonl"
-  printf '%b' "$marker" > "$f/jobs/newjob00/.updater-pin-source"
-  printf '["newjob00"]' > "$f/jobs/pins.json"
-  echo 5 > "$f/jobs/newjob00/order"
+  printf '%b' "$marker" > "$f/jobs/aa11bb22/.updater-pin-source"
+  printf '["aa11bb22"]' > "$f/jobs/pins.json"
+  echo 5 > "$f/jobs/aa11bb22/order"
   {
     echo '#!/bin/bash'
     echo "case \"\$1\" in"
@@ -38,7 +38,7 @@ fixture() { # fixture <dir> <marker-content> <startedAt-in-listing>
     if [ "$ts" = none ]; then
       echo "  agents) echo '[]';;"
     else
-      echo "  agents) echo '[{\"id\":\"newjob00\",\"sessionId\":\"sid-new\",\"cwd\":\"/home/x\",\"name\":\"s\",\"kind\":\"background\",\"status\":\"idle\",\"startedAt\":$ts}]';;"
+      echo "  agents) echo '[{\"id\":\"aa11bb22\",\"sessionId\":\"sid-new\",\"cwd\":\"/home/x\",\"name\":\"s\",\"kind\":\"background\",\"status\":\"idle\",\"startedAt\":$ts}]';;"
     fi
     echo "  *) echo '$VERSION';;"
     echo "esac"
@@ -55,12 +55,17 @@ pins()   { tr -d '\n ' < "$1/jobs/pins.json"; }
 echo "pin repair guard"
 
 # A job the daemon lists is not necessarily a job that still holds its
-# conversation: a respawn gives it a new process and a new start time.
+# conversation: a respawn gives it a new process and a new start time. Absent a
+# recorded start time the two are indistinguishable, so a live job keeps its pin.
 fixture "$WORK/a" 'oldjob00\n' 1000; repair "$WORK/a"
-check "legacy marker, job listed: repairs" '["oldjob00"]' "$(pins "$WORK/a")"
+check "no recorded start time, job listed: leaves the pin alone" '["aa11bb22"]' "$(pins "$WORK/a")"
+check "  and exits 0" "0" "$(cat "$WORK/a/rc")"
+
+fixture "$WORK/a2" 'oldjob00\n' none; repair "$WORK/a2"
+check "no recorded start time, job gone: repairs" '["oldjob00"]' "$(pins "$WORK/a2")"
 
 fixture "$WORK/b" 'oldjob00\nstartedAt=1000\n' 1000; repair "$WORK/b"
-check "start time matches: leaves the pin alone" '["newjob00"]' "$(pins "$WORK/b")"
+check "start time matches: leaves the pin alone" '["aa11bb22"]' "$(pins "$WORK/b")"
 
 fixture "$WORK/c" 'oldjob00\nstartedAt=999\n' 1000; repair "$WORK/c"
 check "start time differs (respawned): repairs" '["oldjob00"]' "$(pins "$WORK/c")"
@@ -69,13 +74,13 @@ fixture "$WORK/d" 'oldjob00\nstartedAt=1000\n' none; repair "$WORK/d"
 check "job gone from the listing: repairs" '["oldjob00"]' "$(pins "$WORK/d")"
 
 fixture "$WORK/e" 'oldjob00\nstartedAt=1000\n' 1000
-rm -f "$WORK/e/jobs/newjob00/.updater-pin-source"
-printf '{"name":"s","cwd":"/home/x","resumeSessionId":"sid-old"}\n' > "$WORK/e/jobs/newjob00/state.json"
+rm -f "$WORK/e/jobs/aa11bb22/.updater-pin-source"
+printf '{"name":"s","cwd":"/home/x","resumeSessionId":"sid-old"}\n' > "$WORK/e/jobs/aa11bb22/state.json"
 repair "$WORK/e"
-check "pinned job has its own transcript: no change" '["newjob00"]' "$(pins "$WORK/e")"
+check "pinned job has its own transcript: no change" '["aa11bb22"]' "$(pins "$WORK/e")"
 
 # The order file has to travel with the pin, or the pinned slot loses its place.
-fixture "$WORK/f" 'oldjob00\n' 1000; repair "$WORK/f"
+fixture "$WORK/f" 'oldjob00\nstartedAt=999\n' 1000; repair "$WORK/f"
 check "order file follows the pin" "yes" "$([ -f "$WORK/f/jobs/oldjob00/order" ] && echo yes || echo no)"
 
 # The cases above hand-write .updater-pin-source, so they cannot catch a marker
@@ -99,7 +104,7 @@ case "\$1" in
   --version) echo "$VERSION";;
   agents)
     if [ -f "$E/resumed" ]; then
-      echo '[{"id":"newjob00","sessionId":"sid-new","cwd":"$E/wd","name":"s","kind":"background","status":"idle","startedAt":$NEW_TS}]'
+      echo '[{"id":"aa11bb22","sessionId":"sid-new","cwd":"$E/wd","name":"s","kind":"background","status":"idle","startedAt":$NEW_TS}]'
     elif [ -f "$E/down" ]; then
       echo '[]'
     else
@@ -108,10 +113,10 @@ case "\$1" in
   stop) touch "$E/down"; exit 0;;
   --background)
     touch "$E/resumed"
-    mkdir -p "$E/jobs/newjob00"
+    mkdir -p "$E/jobs/aa11bb22"
     printf '{"name":"s","cwd":"$E/wd","resumeSessionId":"sid-new","respawnFlags":["--model","opus"]}\\n' \\
-      > "$E/jobs/newjob00/state.json"
-    echo "backgrounded · newjob00 · s";;
+      > "$E/jobs/aa11bb22/state.json"
+    echo "backgrounded · aa11bb22 · s";;
   *) echo "$VERSION";;
 esac
 FAKE
@@ -126,16 +131,54 @@ chmod +x "$E/bin/curl"
 
 PATH="$E/bin:$PATH" CLAUDE_BIN="$E/fake/claude" CLAUDE_CONFIG_DIR="$E" \
   UPDATER_POLL=1 UPDATER_IDLE_STREAK=1 "$BIN" --force >"$E/out" 2>&1
-check "rollout moves the pin to the resumed job" '["newjob00"]' "$(tr -d '\n ' < "$E/jobs/pins.json")"
+check "rollout moves the pin to the resumed job" '["aa11bb22"]' "$(tr -d '\n ' < "$E/jobs/pins.json")"
 check "marker names the source job" "oldjob00" \
-  "$(head -1 "$E/jobs/newjob00/.updater-pin-source" 2>/dev/null)"
+  "$(head -1 "$E/jobs/aa11bb22/.updater-pin-source" 2>/dev/null)"
 # Without this line the repair guard cannot tell a live resume from a respawn,
 # and every later pass hands the pin back to the job it stopped.
 check "marker records the resumed start time" "startedAt=$NEW_TS" \
-  "$(sed -n 2p "$E/jobs/newjob00/.updater-pin-source" 2>/dev/null)"
+  "$(sed -n 2p "$E/jobs/aa11bb22/.updater-pin-source" 2>/dev/null)"
 
 PATH="$E/bin:$PATH" repair "$E"
-check "repair after a rollout leaves the pin alone" '["newjob00"]' "$(tr -d '\n ' < "$E/jobs/pins.json")"
+check "repair after a rollout leaves the pin alone" '["aa11bb22"]' "$(tr -d '\n ' < "$E/jobs/pins.json")"
+check "repair exits 0" "0" "$(cat "$E/rc")"
+
+# A resume that reports failure after the session came up must not be retried:
+# the retry would start a second agent on the same conversation.
+R="$WORK/rc"
+mkdir -p "$R/jobs/oldjob00" "$R/projects/-h" "$R/fake" "$R/wd" "$R/bin"
+printf '{"name":"s","cwd":"%s/wd","resumeSessionId":"sid-old","respawnFlags":["--model","opus"]}\n' "$R" \
+  > "$R/jobs/oldjob00/state.json"
+echo x > "$R/projects/-h/sid-old.jsonl"
+printf '["oldjob00"]' > "$R/jobs/pins.json"
+cat > "$R/fake/claude" <<FAKE
+#!/bin/bash
+case "\$1" in
+  --version) echo "$VERSION";;
+  agents)
+    if [ -f "$R/resumed" ]; then
+      echo '[{"id":"cc33dd44","sessionId":"sid-new","cwd":"$R/wd","name":"s","kind":"background","status":"idle","startedAt":2000}]'
+    elif [ -f "$R/down" ]; then echo '[]'
+    else echo '[{"id":"oldjob00","sessionId":"sid-old","cwd":"$R/wd","name":"s","kind":"background","status":"idle","startedAt":1000}]'; fi;;
+  stop) touch "$R/down"; exit 0;;
+  --background)
+    touch "$R/resumed"
+    mkdir -p "$R/jobs/cc33dd44"
+    printf '{"name":"s","cwd":"$R/wd","resumeSessionId":"sid-new","respawnFlags":["--model","opus"]}\\n' \\
+      > "$R/jobs/cc33dd44/state.json"
+    echo "the session started but I am reporting failure"
+    exit 124;;
+  *) echo "$VERSION";;
+esac
+FAKE
+chmod +x "$R/fake/claude"
+cp "$E/bin/curl" "$R/bin/curl"
+PATH="$R/bin:$PATH" CLAUDE_BIN="$R/fake/claude" CLAUDE_CONFIG_DIR="$R" \
+  UPDATER_POLL=1 UPDATER_IDLE_STREAK=1 "$BIN" --force >"$R/out" 2>&1
+check "a resume that came up despite a non-zero exit is adopted" '["cc33dd44"]' \
+  "$(tr -d '\n ' < "$R/jobs/pins.json")"
+check "  and is not recorded as failed" "absent" \
+  "$([ -f "$R/unattended-update-state.json" ] && echo present || echo absent)"
 
 echo
 echo "$pass passed, $fail failed"

@@ -368,8 +368,8 @@ while queue:
     if job in live and started_at and live[job] == started_at:
         # Still the process we resumed: its transcript appears when prompted.
         continue
-    if job in live and not started_at and not src:
-        # Nothing records that this tool resumed it, so leave it alone.
+    if job in live and not started_at:
+        # Nothing records which process this was, so a live job stays pinned.
         continue
     found = True
     if src:
@@ -452,6 +452,9 @@ fi
 if [ "$FORGET_NEXT" -eq 1 ]; then
   echo "--forget needs a job id" >&2; exit 2
 fi
+if [ -n "$FORGET_ID" ] && [ "$DRY" -eq 1 ]; then
+  say "would forget the failure record for $FORGET_ID"; exit 0
+fi
 if [ -n "$FORGET_ID" ]; then
   if [ "$(python3 -c "$PY_STATE" "$STATE" drop "$FORGET_ID")" = dropped ]; then
     say "forgot the failure record for $FORGET_ID"
@@ -507,10 +510,6 @@ resume_session() {
   out="$(cd "$cwd" || exit 1; \
          DISABLE_AUTOUPDATER=1 timeout "$INSTALL_TIMEOUT" \
            "$CLAUDE" --background --resume "$sid" "${flags[@]}" 2>&1 </dev/null)" || rc=$?
-  if [ "$rc" -ne 0 ]; then
-    printf '%s\n' "$out" >>"$LOG"
-    return 1
-  fi
   newid="$(printf '%s' "$out" | sed 's/\x1b\[[0-9;]*m//g' \
            | awk '/backgrounded/{for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) {print $i; exit}}')"
   if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
@@ -521,21 +520,28 @@ resume_session() {
     fi
   fi
   if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
-    # The resume itself succeeded, so a session is running; recording this as a
-    # failure would make the retry start a second copy of the conversation.
     printf '%s\n' "$out" >>"$LOG"
+    # Nothing appeared and the resume reported failure: it really did fail.
+    [ "$rc" -ne 0 ] && return 1
+    # It ran and something may be up; recording that as a failure would make
+    # the retry start a second copy of the conversation.
     return 2
   fi
   say "    resumed as $newid"
   # The start time of the process now holding the conversation; repair uses it
   # to tell this session from a later respawn of the same job.
-  started="$(agents_json </dev/null | python3 -c '
+  started=""
+  for _ in 1 2 3; do
+    started="$(agents_json </dev/null | python3 -c '
 import json, sys
 want = sys.argv[1]
 for x in json.load(sys.stdin):
     if str(x.get("id")) == want:
         print(x.get("startedAt")); break
 ' "$newid" 2>/dev/null)" || started=""
+    [ -n "$started" ] && break
+    sleep 1
+  done
   python3 -c "$PY_MOVE_PIN" "$JOBS" "$id" "$newid" "$started" >>"$LOG" 2>&1 \
     || say "    WARNING: $name resumed as $newid but its pin could not be moved; see $LOG"
   return 0
