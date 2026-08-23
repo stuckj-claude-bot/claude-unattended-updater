@@ -54,8 +54,11 @@ jobs:
       - name: Verify package contents
         run: |
           deb=$(ls dist/*.deb)
-          dpkg-deb -c "$deb" | grep -q usr/bin/claude-unattended-update
-          dpkg-deb -c "$deb" | grep -q usr/lib/systemd/user/claude-unattended-update.timer
+          # Match the path column exactly; an unanchored search also passes for
+          # a package that merely mentions the name under another prefix.
+          paths=$(dpkg-deb -c "$deb" | awk '{print $NF}')
+          printf '%s\n' "$paths" | grep -qx './usr/bin/claude-unattended-update'
+          printf '%s\n' "$paths" | grep -qx './usr/lib/systemd/user/claude-unattended-update.timer'
 
       - name: Verify the rpm is signed in its header
         run: |

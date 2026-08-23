@@ -21,7 +21,7 @@
 #     left on the old job id points at a dead job; step 4 moves it. --repair
 #     fixes pins that already went stale this way.
 #
-# Usage: claude-unattended-update [--dry-run] [--force] [--repair]
+# Usage: claude-unattended-update [--dry-run] [--force] [--repair] [--forget <job-id>]
 
 set -uo pipefail
 
@@ -39,15 +39,18 @@ DEADLINE="${UPDATER_DEADLINE:-$((6*60*60))}"       # per session
 INSTALL_TIMEOUT="${UPDATER_INSTALL_TIMEOUT:-900}"
 PASS_DEADLINE="${UPDATER_PASS_DEADLINE:-$((12*60*60))}"  # whole pass
 CLAUDE_TIMEOUT="${UPDATER_CLAUDE_TIMEOUT:-120}"
+MAX_RETRIES="${UPDATER_MAX_RETRIES:-3}"
 
-DRY=0; FORCE=0; REPAIR_ONLY=0
+DRY=0; FORCE=0; REPAIR_ONLY=0; FORGET_NEXT=0; FORGET_ID=""
 for a in "$@"; do
   case "$a" in
     --dry-run) DRY=1 ;;
     --force)   FORCE=1 ;;
     --repair)  REPAIR_ONLY=1 ;;
+    --forget)  FORGET_NEXT=1 ;;
     -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "unknown option: $a" >&2; exit 2 ;;
+    *) if [ "$FORGET_NEXT" -eq 1 ]; then FORGET_ID="$a"; FORGET_NEXT=0
+       else echo "unknown option: $a" >&2; exit 2; fi ;;
   esac
 done
 
@@ -66,7 +69,7 @@ EXE="$(readlink -f "$CLAUDE" 2>/dev/null || echo "$CLAUDE")"
 
 # A wedged daemon makes these calls hang forever; the unit has no timeout of
 # its own, and while it runs the hourly timer is suppressed.
-run_claude() { timeout "$CLAUDE_TIMEOUT" "$CLAUDE" "$@"; }
+run_claude() { DISABLE_AUTOUPDATER=1 timeout "$CLAUDE_TIMEOUT" "$CLAUDE" "$@"; }
 
 installed_version() { run_claude --version 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+'; }
 
@@ -102,17 +105,45 @@ for s in d:
     if started<cut:
         sys.stdout.write("\x1f".join([str(s.get("id")),str(s.get("sessionId")),str(s.get("cwd")),str(s.get("name"))])+"\0")
 '
+# Prints a live job that accounts for $1 — the job itself if it never stopped,
+# or the one we resumed from it. Fails when the session list cannot be read, so
+# callers do not mistake that for "nothing is running".
+find_live_for() {
+  local listing
+  listing="$(agents_json </dev/null)" || return 2
+  printf '%s' "$listing" | python3 -c '
+import json, os, sys
+jobs, old = sys.argv[1], sys.argv[2]
+for x in json.load(sys.stdin):
+    ident = str(x.get("id"))
+    if ident == old:
+        print(ident); break
+    marker = os.path.join(jobs, ident, ".updater-pin-source")
+    try:
+        if open(marker).read().split("\n")[0].strip() == old:
+            print(ident); break
+    except OSError:
+        pass
+' "$JOBS" "$1"
+}
+
 PY_FIND_NEW='
 import json, sys
-cwd, name, since = sys.argv[1], sys.argv[2], float(sys.argv[3])
+# A background job present now and absent before the resume is the one the
+# resume minted. Comparing wall-clock start times instead would reject a session
+# the daemon stamped a moment early.
+before = set(sys.argv[1].split())
+cwd = sys.argv[2]
 try: d = json.load(sys.stdin)
 except Exception: raise SystemExit
-for x in d:
-    if x.get("kind") != "background": continue
-    if x.get("cwd") != cwd or x.get("name") != name: continue
-    ts = x.get("startedAt")
-    if isinstance(ts, (int, float)) and ts / 1000.0 >= since:
-        print(x.get("id")); break
+fresh = [str(x.get("id")) for x in d
+         if x.get("kind") == "background"
+         and str(x.get("id")) not in before
+         and x.get("cwd") == cwd]
+# Exactly one new job in this directory is an identification; more than one is a
+# guess, and guessing moves a pin onto an unrelated conversation.
+if len(fresh) == 1:
+    print(fresh[0])
 '
 PY_STATE='
 import json, os, sys, tempfile
@@ -133,11 +164,34 @@ if action == "record":
                                             "state.json"))).get("respawnFlags") or []
     except Exception:
         pass
+    prior = next((f for f in d["failed"] if f.get("id") == ident), None)
     d["failed"] = [f for f in d["failed"] if f.get("id") != ident]
     d["failed"].append({"id": ident, "sessionId": sid, "cwd": cwd,
-                        "name": name, "respawnFlags": flags})
+                        "name": name, "respawnFlags": flags,
+                        "attempts": int((prior or {}).get("attempts") or 0)})
+elif action == "count-failed":
+    print(len(d["failed"])); raise SystemExit
+elif action == "count-attempts":
+    for f in d["failed"]:
+        if f.get("id") == sys.argv[3]:
+            print(int(f.get("attempts") or 0)); break
+    else:
+        print(0)
+    raise SystemExit
+elif action == "attempt":
+    for f in d["failed"]:
+        if f.get("id") == sys.argv[3]:
+            f["attempts"] = int(f.get("attempts") or 0) + 1
+            print(f["attempts"])
+            break
+    else:
+        raise SystemExit
 elif action == "drop":
-    d["failed"] = [f for f in d["failed"] if f.get("id") != sys.argv[3]]
+    kept = [f for f in d["failed"] if f.get("id") != sys.argv[3]]
+    keptp = [i for i in d["pending"] if i != sys.argv[3]]
+    print("dropped" if (len(kept) != len(d["failed"]) or len(keptp) != len(d["pending"]))
+          else "absent")
+    d["failed"], d["pending"] = kept, keptp
 elif action == "pending":
     d["rolloutVersion"] = sys.argv[3]
     d["pending"] = sys.argv[4:]
@@ -149,7 +203,8 @@ elif action == "read":
 elif action == "flags":
     for f in d["failed"]:
         if f.get("id") == sys.argv[3]:
-            sys.stdout.write("\0".join(f.get("respawnFlags") or []))
+            sys.stdout.write("\0".join(
+                x for x in (f.get("respawnFlags") or []) if x != "--reply-on-resume"))
             break
     raise SystemExit
 elif action == "count":
@@ -165,14 +220,45 @@ with os.fdopen(fd, "w") as fh:
     fh.flush(); os.fsync(fh.fileno())
 os.replace(tmp, path)
 '
+PY_MARK='
+import os, sys
+JOBS, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+started = sys.argv[4] if len(sys.argv) > 4 else ""
+marker = os.path.join(JOBS, new, ".updater-pin-source")
+lines = []
+if os.path.exists(marker):
+    lines = [l for l in open(marker).read().split("\n") if l.strip()]
+if not lines:
+    lines = [old]
+if started and not any(l.startswith("startedAt=") for l in lines):
+    lines.append("startedAt=" + started)
+fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+with os.fdopen(fd, "w") as fh:
+    fh.write("\n".join(lines) + "\n")
+    fh.flush(); os.fsync(fh.fileno())
+'
+PY_RESOLVE_SID='
+import glob, json, os, sys
+JOBS, PROJ, job, sid = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+def has(s):
+    return bool(s) and bool(glob.glob(os.path.join(PROJ, "*", s + ".jsonl")))
+
+if has(sid):
+    print(sid); raise SystemExit
+try:
+    src = open(os.path.join(JOBS, job, ".updater-pin-source")).read().split("\n")[0].strip()
+    d = json.load(open(os.path.join(JOBS, src, "state.json")))
+except Exception:
+    raise SystemExit
+osid = d.get("resumeSessionId") or d.get("sessionId")
+if has(osid):
+    print(osid)
+'
 PY_MOVE_PIN='
 import json, os, shutil, sys, tempfile
 JOBS, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
 p = os.path.join(JOBS, "pins.json")
-# Written even when the job was not pinned, so --repair can always tell a
-# resumed session from a pin orphaned by a reaped respawn.
-with open(os.path.join(JOBS, new, ".updater-pin-source"), "w") as fh:
-    fh.write(old + "\n")
 try: pins = json.load(open(p))
 except Exception: raise SystemExit
 if old not in pins: raise SystemExit
@@ -193,7 +279,7 @@ print(f"    pin moved {old} -> {new}")
 PY_FLAGS='
 import json, sys
 d = json.load(open(sys.argv[1]))
-flags = d.get("respawnFlags") or []
+flags = [f for f in (d.get("respawnFlags") or []) if f != "--reply-on-resume"]
 if not flags:
     sys.exit(1)
 sys.stdout.write("\0".join(flags))
@@ -245,16 +331,23 @@ repair_pins() {
   # which is indistinguishable from a phantom pin on disk alone. Liveness tells
   # them apart, so without a readable session list this refuses to act.
   local live
-  live="$(agents_json | python3 -c 'import json,sys;print(" ".join(str(s.get("id")) for s in json.load(sys.stdin)))' 2>/dev/null)" \
+  live="$(agents_json | python3 -c 'import json,sys;print(" ".join(str(s.get("id"))+":"+str(s.get("startedAt")) for s in json.load(sys.stdin)))' 2>/dev/null)" \
     || { say "  cannot read the session list; refusing to repair"; return 1; }
-  python3 - "$JOBS" "$PROJECTS" "${1:-report}" "$live" <<'PY'
+  python3 - "$JOBS" "$PROJECTS" "${1:-report}" "$live" "${2:-all}" <<'PY'
 import json, glob, os, shutil, sys, tempfile
 JOBS, PROJ, mode = sys.argv[1], sys.argv[2], sys.argv[3]
-live = set((sys.argv[4] if len(sys.argv) > 4 else "").split())
+scope = sys.argv[5] if len(sys.argv) > 5 else "all"
+# id -> start time of the process the daemon currently has for that job.
+live = {}
+for item in (sys.argv[4] if len(sys.argv) > 4 else "").split():
+    ident, _, started = item.partition(":")
+    live[ident] = started
 pins_path = os.path.join(JOBS, "pins.json")
 try:
     pins = json.load(open(pins_path))
 except Exception as e:
+    if isinstance(e, FileNotFoundError):
+        print("  no pins.json; nothing to repair"); raise SystemExit
     print(f"  cannot read pins.json: {e}"); sys.exit(1)
 
 def load(j):
@@ -289,15 +382,28 @@ while queue:
     sid = d.get("resumeSessionId") or d.get("sessionId")
     if transcript_for(sid):
         continue
-    if job in live:
-        # Running: its transcript appears when it is next prompted.
+    marker = os.path.join(JOBS, job, ".updater-pin-source")
+    src, started_at = "", ""
+    if os.path.exists(marker):
+        lines = open(marker).read().split("\n")
+        src = lines[0].strip()
+        for ln in lines[1:]:
+            if ln.startswith("startedAt="):
+                started_at = ln.split("=", 1)[1].strip()
+    if job in live and started_at and live[job] == started_at:
+        # Still the process we resumed: its transcript appears when prompted.
+        continue
+    if job in live and not started_at:
+        # Nothing records which process this was, so a live job stays pinned.
         continue
     found = True
-    marker = os.path.join(JOBS, job, ".updater-pin-source")
-    if os.path.exists(marker):
-        src = open(marker).read().strip()
+    if src:
         if os.path.isdir(os.path.join(JOBS, src)) and src not in pins:
-            print(f'  {job}: resumed from {src} and never prompted; restoring that pin')
+            why = ("was respawned, losing what it held"
+                   if job in live else "never started again")
+            print(f'  {job}: resumed from {src}, never prompted, and {why}; restoring that pin')
+            if mode != "apply":
+                unrepaired = True
             if mode == "apply":
                 pins[pins.index(job)] = src
                 write_pins(pins)
@@ -307,6 +413,8 @@ while queue:
                 changed = True
                 queue.append(src)
             continue
+    if scope != "all":
+        continue
     name, cwd = d.get("name"), d.get("cwd")
     print(f'  {job} ("{name}"): session {sid} has no transcript')
     # A job dir is named for the first 8 chars of its session id, so the owner
@@ -329,13 +437,14 @@ while queue:
     if not cands:
         print("    no replacement found — needs a human"); unrepaired = True; continue
     cands.sort(key=lambda c: c[3], reverse=True)
-    if len(cands) > 1 and cands[0][3] == cands[1][3]:
+    if len(cands) > 1 and cands[0][3] - cands[1][3] < 60:
         names = ", ".join(sorted(c[0] for c in cands))
-        print(f"    ambiguous: {names} share a timestamp — refusing to guess")
+        print(f"    ambiguous: {names} were active within a minute — refusing to guess")
         unrepaired = True; continue
     other, osid, size, _ = cands[0]
-    print(f"    -> job {other} owns {osid} ({size/1e6:.1f}MB)")
+    print(f"    -> best guess: job {other} owns {osid} ({size/1e6:.1f}MB)")
     if mode != "apply":
+        unrepaired = True
         continue
     pins[pins.index(job)] = other
     write_pins(pins)
@@ -356,19 +465,169 @@ sys.exit(1 if unrepaired else 0)
 PY
 }
 
+if ! exec 9>"$CLAUDE_DIR/.unattended-update.lock"; then
+  say "cannot open the lock file under $CLAUDE_DIR"; exit 1
+fi
+if ! flock -n 9; then
+  say "another run holds the lock; exiting"
+  [ "$REPAIR_ONLY" -eq 1 ] && exit 1
+  exit 0
+fi
+
+if [ "$FORGET_NEXT" -eq 1 ]; then
+  echo "--forget needs a job id" >&2; exit 2
+fi
+if [ -n "$FORGET_ID" ] && [ "$DRY" -eq 1 ]; then
+  say "would forget the failure record for $FORGET_ID"; exit 0
+fi
+if [ -n "$FORGET_ID" ]; then
+  if [ "$(python3 -c "$PY_STATE" "$STATE" drop "$FORGET_ID")" = dropped ]; then
+    say "forgot the failure record for $FORGET_ID"
+    exit 0
+  fi
+  say "no failure record for $FORGET_ID"; exit 1
+fi
+
 if [ "$REPAIR_ONLY" -eq 1 ]; then
   say "repairing phantom pins..."
-  repair_pins "$([ "$DRY" -eq 1 ] && echo report || echo apply)"
+  repair_pins "$([ "$DRY" -eq 1 ] && echo report || echo apply)" all | tee -a "$LOG"
   exit $?
 fi
 
-[ -e "$INHIBIT" ] && { say "inhibited by $INHIBIT"; exit 0; }
+[ -e "$INHIBIT" ] && [ "$DRY" -eq 0 ] && { say "inhibited by $INHIBIT"; exit 0; }
+[ -e "$INHIBIT" ] && say "note: $INHIBIT is present; this is a dry run so it reports anyway"
 
-# systemd serialises the timer against itself, but a manual run alongside it
-# could stop and resume the same session twice.
-exec 9>"$CLAUDE_DIR/.unattended-update.lock"
-if ! flock -n 9; then
-  say "another run holds the lock; exiting"; exit 0
+
+
+# A session with no replayable flags, no directory, or no session id cannot be
+# brought back as it was, and resuming into the wrong directory silently
+# reroutes every relative path the agent uses.
+restart_possible() {
+  local id="$1" cwd="$2" name="$3"  # $4 = session id
+  if ! python3 -c "$PY_FLAGS" "$JOBS/$id/state.json" >/dev/null 2>>"$LOG"; then
+    say "    no usable respawnFlags in $JOBS/$id/state.json; leaving $name alone"
+    return 1
+  fi
+  if [ ! -d "$cwd" ]; then
+    say "    $cwd no longer exists; leaving $name alone"
+    return 1
+  fi
+  case "${4:-}" in
+    ""|None|null) say "    no session id for $name; leaving it alone"; return 1 ;;
+  esac
+  return 0
+}
+
+# Resume $sid, replaying the job's respawnFlags, and carry the pin to the job
+# id the resume mints. Prints nothing on success beyond the new id.
+resume_session() {
+  local id="$1" sid="$2" cwd="$3" name="$4" out newid rc=0 started
+  local -a flags=()
+  if [ -n "${5:-}" ] && [ -s "$5" ]; then
+    mapfile -d '' -t flags < "$5"
+  else
+    python3 -c "$PY_FLAGS" "$JOBS/$id/state.json" > "$WORKFILE" 2>>"$LOG" || return 1
+    mapfile -d '' -t flags < "$WORKFILE"
+  fi
+  [ "${#flags[@]}" -gt 0 ] || return 1
+  local before before_ok=1
+  before="$(agents_json </dev/null | python3 -c 'import json,sys;print(" ".join(str(x.get("id")) for x in json.load(sys.stdin)))' 2>/dev/null)" || before_ok=0
+  out="$(cd "$cwd" || exit 1; \
+         DISABLE_AUTOUPDATER=1 timeout "$INSTALL_TIMEOUT" \
+           "$CLAUDE" --background --resume "$sid" "${flags[@]}" 2>&1 </dev/null)" || rc=$?
+  newid="$(printf '%s' "$out" | sed 's/\x1b\[[0-9;]*m//g' \
+           | awk '/backgrounded/{for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) {print $i; exit}}')"
+  if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
+    # Failing to read the announcement is not evidence that no session started,
+    # and recording a live session as failed makes the retry fork a second copy.
+    if [ "$before_ok" -eq 1 ]; then
+      newid="$(agents_json </dev/null | python3 -c "$PY_FIND_NEW" "$before" "$cwd")"
+    fi
+  fi
+  if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
+    printf '%s\n' "$out" >>"$LOG"
+    # Nothing appeared and the resume reported failure: it really did fail.
+    [ "$rc" -ne 0 ] && return 1
+    # It ran and something may be up; recording that as a failure would make
+    # the retry start a second copy of the conversation.
+    return 2
+  fi
+  say "    resumed as $newid"
+  python3 -c "$PY_MARK" "$JOBS" "$id" "$newid" >>"$LOG" 2>&1 || true
+  # The start time of the process now holding the conversation; repair uses it
+  # to tell this session from a later respawn of the same job.
+  started=""
+  for _ in 1 2 3; do
+    started="$(agents_json </dev/null | python3 -c '
+import json, sys
+want = sys.argv[1]
+for x in json.load(sys.stdin):
+    if str(x.get("id")) == want:
+        print(x.get("startedAt")); break
+' "$newid" 2>/dev/null)" || started=""
+    [ -n "$started" ] && break
+    sleep 1
+  done
+  [ -n "$started" ] && { python3 -c "$PY_MARK" "$JOBS" "$id" "$newid" "$started" >>"$LOG" 2>&1 || true; }
+  python3 -c "$PY_MOVE_PIN" "$JOBS" "$id" "$newid" >>"$LOG" 2>&1 \
+    || say "    WARNING: $name resumed as $newid but its pin could not be moved; see $LOG"
+  return 0
+}
+
+# Sessions an earlier pass stopped but could not bring back are not in the live
+# list, so nothing else rediscovers them.
+retry_failed() {
+  [ "$DRY" -eq 1 ] && return 0
+  [ -r "$STATE" ] || return 0
+  local rows id sid cwd name
+  rows="$(python3 -c "$PY_STATE" "$STATE" read)" || return 0
+  [ -z "$rows" ] && return 0
+  while IFS=$'\x1f' read -r id sid cwd name; do
+    [ -z "${sid:-}" ] && continue
+    live_id="$(find_live_for "$id")"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+      say "  cannot read the session list; leaving $name recorded"
+      continue
+    fi
+    if [ -n "$live_id" ]; then
+      # A pass killed between the resume and dropping the record would
+      # otherwise fork a second agent on the same conversation.
+      say "  $name is accounted for by live job $live_id; clearing its record"
+      python3 -c "$PY_STATE" "$STATE" drop "$id" >/dev/null
+      continue
+    fi
+    tries="$(python3 -c "$PY_STATE" "$STATE" count-attempts "$id")"
+    if [ "${tries:-0}" -ge "$MAX_RETRIES" ]; then
+      say "  $name has failed to resume $MAX_RETRIES times; not retrying"
+      say "    clear it with: claude-unattended-update --forget $id"
+      continue
+    fi
+    tries="$(python3 -c "$PY_STATE" "$STATE" attempt "$id")"
+    say "retrying $name, stopped by an earlier pass and never resumed (attempt $tries)"
+    python3 -c "$PY_STATE" "$STATE" flags "$id" > "$FLAGFILE" 2>/dev/null
+    sid_eff="$(python3 -c "$PY_RESOLVE_SID" "$JOBS" "$PROJECTS" "$id" "$sid" 2>/dev/null)"
+    [ -z "$sid_eff" ] && sid_eff="$sid"
+    resume_session "$id" "$sid_eff" "$cwd" "$name" "$FLAGFILE"; rrc=$?
+    if [ "$rrc" -eq 2 ]; then
+      say "  $name came back but could not be identified; its pin was not moved"
+      python3 -c "$PY_STATE" "$STATE" drop "$id" >/dev/null
+      continue
+    fi
+    if [ "$rrc" -eq 0 ]; then
+      # Dropped immediately: a later exit path may never rewrite the state file,
+      # and a record left behind forks another live copy every hour.
+      python3 -c "$PY_STATE" "$STATE" drop "$id" >/dev/null
+      say "  recovered $name"
+    else
+      say "  still cannot resume $name; it stays recorded"
+    fi
+  done <<< "$rows"
+}
+pass_start=$SECONDS
+if [ "$DRY" -eq 0 ]; then
+  # Markers only: the candidate search guesses from name and cwd, which is fine
+  # under a human running --repair and not fine running unattended every hour.
+  repair_pins apply markers >>"$LOG" 2>&1 || true
 fi
 
 have="$(installed_version)"
@@ -401,7 +660,7 @@ else
     say "DRY RUN: would install $want now"
   else
     say "installing $want ..."
-    env -u DISABLE_AUTOUPDATER timeout "$INSTALL_TIMEOUT" "$CLAUDE" update >>"$LOG" 2>&1 \
+    env -u DISABLE_AUTOUPDATER timeout "$INSTALL_TIMEOUT" "$CLAUDE" update >>"$LOG" 2>&1 </dev/null \
       || say "installer exited non-zero; see $LOG"
     got="$(installed_version)"
     if [ "$got" != "$want" ]; then
@@ -440,81 +699,7 @@ else
 fi
 
 
-# Resume $sid, replaying the job's respawnFlags, and carry the pin to the job
-# id the resume mints. Prints nothing on success beyond the new id.
-# Resuming without --permission-mode or --model would strand an unattended
-# session at its first prompt and leave it unfindable by name, and resuming into
-# the wrong directory silently reroutes every relative path the agent uses.
-restart_possible() {
-  local id="$1" cwd="$2" name="$3"
-  if ! python3 -c "$PY_FLAGS" "$JOBS/$id/state.json" >/dev/null 2>>"$LOG"; then
-    say "    no usable respawnFlags in $JOBS/$id/state.json; leaving $name alone"
-    return 1
-  fi
-  if [ ! -d "$cwd" ]; then
-    say "    $cwd no longer exists; leaving $name alone"
-    return 1
-  fi
-  return 0
-}
-
-resume_session() {
-  local id="$1" sid="$2" cwd="$3" name="$4" out newid
-  local -a flags=()
-  if [ -n "${5:-}" ] && [ -s "$5" ]; then
-    mapfile -d '' -t flags < "$5"
-  else
-    python3 -c "$PY_FLAGS" "$JOBS/$id/state.json" > "$WORKFILE" 2>>"$LOG" || return 1
-    mapfile -d '' -t flags < "$WORKFILE"
-  fi
-  [ "${#flags[@]}" -gt 0 ] || return 1
-  local since; since="$(date +%s)"
-  out="$(cd "$cwd" || exit 1; \
-         DISABLE_AUTOUPDATER=1 timeout "$INSTALL_TIMEOUT" \
-           "$CLAUDE" --background --resume "$sid" "${flags[@]}" 2>&1 </dev/null)"
-  newid="$(printf '%s' "$out" | sed 's/\x1b\[[0-9;]*m//g' \
-           | awk '/backgrounded/{for(i=1;i<=NF;i++) if ($i ~ /^[0-9a-f]{8}$/) {print $i; exit}}')"
-  if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
-    # Failing to read the announcement is not evidence that no session started,
-    # and recording a live session as failed makes the retry fork a second copy.
-    newid="$(agents_json </dev/null | python3 -c "$PY_FIND_NEW" "$cwd" "$name" "$since")"
-  fi
-  if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
-    printf '%s\n' "$out" >>"$LOG"
-    return 1
-  fi
-  say "    resumed as $newid"
-  python3 -c "$PY_MOVE_PIN" "$JOBS" "$id" "$newid" 2>>"$LOG" \
-    || say "    WARNING: $name resumed as $newid but its pin could not be moved; see $LOG"
-  return 0
-}
-
-# Sessions an earlier pass stopped but could not bring back are not in the live
-# list, so nothing else rediscovers them.
-retry_failed() {
-  [ "$DRY" -eq 1 ] && return 0
-  [ -r "$STATE" ] || return 0
-  local rows id sid cwd name
-  rows="$(python3 -c "$PY_STATE" "$STATE" read)" || return 0
-  [ -z "$rows" ] && return 0
-  while IFS=$'\x1f' read -r id sid cwd name; do
-    [ -z "${sid:-}" ] && continue
-    say "retrying $name, stopped by an earlier pass and never resumed"
-    python3 -c "$PY_STATE" "$STATE" flags "$id" > "$FLAGFILE" 2>/dev/null
-    if resume_session "$id" "$sid" "$cwd" "$name" "$FLAGFILE"; then
-      # Dropped immediately: a later exit path may never rewrite the state file,
-      # and a record left behind forks another live copy every hour.
-      python3 -c "$PY_STATE" "$STATE" drop "$id"
-      say "  recovered $name"
-    else
-      say "  still cannot resume $name; it stays recorded"
-    fi
-  done <<< "$rows"
-}
-retry_failed
-if [ "$DRY" -eq 0 ]; then
-  repair_pins apply >>"$LOG" 2>&1 || true
-fi
+[ "$DRY" -eq 0 ] && retry_failed
 
 new_version="$(installed_version)"
 if ! bin_mtime="$(stat -c %Y "$EXE" 2>/dev/null)"; then
@@ -527,7 +712,11 @@ fi
 # becomes once a real install lands.
 [ "$DRY" -eq 1 ] && bin_mtime="$(date +%s)"
 
-sessions="$(agents_json)" || { say "could not read the session list; deferring"; exit 0; }
+if ! sessions="$(agents_json)"; then
+  say "could not read the session list; deferring"
+  [ "$(python3 -c "$PY_STATE" "$STATE" count-failed 2>/dev/null || echo 0)" -gt 0 ] && exit 1
+  exit 0
+fi
 if ! printf '%s' "$sessions" | python3 -c "$PY_STALE" "$bin_mtime" > "$STALEFILE" 2>>"$LOG"; then
   say "could not classify the session list; see $LOG"; exit 1
 fi
@@ -540,7 +729,7 @@ if [ "${count:-0}" -eq 0 ]; then
     # removes the file when nothing at all is outstanding.
     python3 -c "$PY_STATE" "$STATE" pending "$new_version"
   fi
-  if [ -s "$STATE" ]; then
+  if [ "$(python3 -c "$PY_STATE" "$STATE" count-failed 2>/dev/null || echo 0)" -gt 0 ]; then
     say "no sessions on the old binary, but earlier failures are still recorded"
     exit 1
   fi
@@ -554,7 +743,7 @@ if [ "$DRY" -eq 1 ]; then
   exit 0
 fi
 
-pending=""; failed=""; pass_start=$SECONDS
+pending=""; failed=""
 while IFS=$'\x1f' read -r -d '' id sid cwd name; do
   [ -z "${id:-}" ] && continue
   # Sessions are handled in order, so a busy one holds up those behind it;
@@ -589,30 +778,58 @@ while IFS=$'\x1f' read -r -d '' id sid cwd name; do
   [ "$skip" -eq 1 ] && continue
 
   say "  $name ($id): idle — restarting onto $new_version"
-  if ! restart_possible "$id" "$cwd" "$name"; then
+  if ! restart_possible "$id" "$cwd" "$name" "$sid"; then
     pending="$pending $id"
     continue
   fi
-  python3 -c "$PY_STATE" "$STATE" record "$id" "$sid" "$cwd" "$name"
-  if ! run_claude stop "$id" >>"$LOG" 2>&1 </dev/null; then
-    # A stop that timed out may still have stopped the session; resuming one
-    # that is genuinely still running would leave two live copies.
-    if agents_json </dev/null | python3 -c "$PY_STATUS" "$id" | grep -q '^gone$'; then
-      log "    stop reported failure for $name but the session is gone; continuing"
-    else
-      say "    stop failed for $name; leaving it alone"
-      python3 -c "$PY_STATE" "$STATE" drop "$id"
-      pending="$pending $id"
-      continue
-    fi
+  sid_eff="$(python3 -c "$PY_RESOLVE_SID" "$JOBS" "$PROJECTS" "$id" "$sid" 2>/dev/null)"
+  if [ -z "$sid_eff" ]; then
+    say "    $name has no resumable transcript; leaving it alone"
+    pending="$pending $id"
+    continue
   fi
-  sleep 3
-  for _ in 1 2 3 4 5; do
-    agents_json </dev/null | python3 -c "$PY_STATUS" "$id" | grep -q '^gone$' && break
+  if ! python3 -c "$PY_STATE" "$STATE" record "$id" "$sid" "$cwd" "$name"; then
+    # This record is the only thing that survives the stop; without it a failure
+    # later in the restart loses the session silently.
+    say "    cannot record $name in $STATE; not stopping it"
+    pending="$pending $id"
+    continue
+  fi
+  stop_rc=0
+  run_claude stop "$id" >>"$LOG" 2>&1 </dev/null || stop_rc=$?
+  # `claude stop` returning 0 means the daemon accepted the stop, not that the
+  # session has finished; resuming one that is still running leaves two live
+  # copies of the same conversation acting on the same directory.
+  gone=unknown
+  for _ in $(seq 1 8); do
+    if st="$(agents_json </dev/null | python3 -c "$PY_STATUS" "$id" 2>/dev/null)"; then
+      [ "$st" = gone ] && { gone=yes; break; }
+      gone=no
+    else
+      gone=unknown
+    fi
     sleep 2
   done
-  if resume_session "$id" "$sid" "$cwd" "$name"; then
-    python3 -c "$PY_STATE" "$STATE" drop "$id"
+  if [ "$gone" != yes ]; then
+    # Whether it is winding down slowly or the list was unreadable, the record
+    # stays: retry_failed asks whether the session is accounted for before it
+    # resumes anything, which is the only safe way to settle this.
+    say "    cannot confirm $name stopped (stop exit $stop_rc); leaving it recorded"
+    failed="$failed $id"
+    continue
+  fi
+
+  resume_session "$id" "$sid_eff" "$cwd" "$name"; rrc=$?
+  if [ "$rrc" -eq 0 ]; then
+    python3 -c "$PY_STATE" "$STATE" drop "$id" >/dev/null
+    continue
+  fi
+  if [ "$rrc" -eq 2 ]; then
+    # Running but unidentified: recording it would make the retry start a
+    # second agent on the same conversation.
+    say "    WARNING: $name came back but could not be identified; its pin was not moved"
+    python3 -c "$PY_STATE" "$STATE" drop "$id" >/dev/null
+    pending="$pending $id"
     continue
   fi
   # The stop succeeded, so this session is down and the live list will not

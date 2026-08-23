@@ -20,7 +20,7 @@ point of driving Claude Code from a phone.
 
 One engine owns the whole sequence, so nothing races it:
 
-1. **Check** hourly for a new release. Nothing new, exit immediately — it is one registry lookup.
+1. **Check** hourly for a new release. Nothing new, exit quickly — a registry lookup, plus a pass over the pins.
 2. **Install** the new version and wait for it to land completely.
 3. **Find** sessions still running the old binary.
 4. **Restart** each one *only once it is genuinely idle*, then move its pin across.
@@ -104,14 +104,25 @@ claude-unattended-update              # what the timer runs
 claude-unattended-update --dry-run    # report only, change nothing
 claude-unattended-update --force      # ignore "already up to date"
 claude-unattended-update --repair     # fix pins pointing at a dead session
+claude-unattended-update --forget ID  # drop a stuck failure record
 ```
 
-Every pass also puts back any pin left pointing at a session that cannot be
-resumed, so `--repair` is only needed to inspect or to fix one by hand.
+A session the updater stopped that does not come back is recorded and retried on
+later passes. After `UPDATER_MAX_RETRIES` attempts it stops retrying and the run
+exits non-zero every pass, so the failure stays visible rather than being
+forgotten. `--forget <job-id>` clears that record once you have dealt with it —
+the id is in the message and in the log. It also clears a session parked in
+`pending`, which is where one lands when its directory is gone or its recorded
+flags are unusable, and which nothing else clears.
+
+Every pass puts back a pin the updater itself moved, when the session it moved
+it to turned out never to start. Repairing a pin it has no record of means
+guessing from the session's name and directory, so that is left to `--repair`,
+which a human runs deliberately.
 
 Pause update runs at any time by creating the inhibit file — a pass already
-waiting for a session to go idle notices it too (`--repair` is a manual command
-and runs regardless):
+waiting for a session to go idle notices it too. `--repair` and `--dry-run` are
+manual and report regardless, since neither installs or restarts anything:
 
 ```bash
 touch ~/.claude/no-auto-update
@@ -127,11 +138,13 @@ touch ~/.claude/no-auto-update
 | `UPDATER_TMUX_SOCKET` | unset | Keep the restarted daemon in this tmux socket |
 | `CLAUDE_BIN` | from `PATH` | Path to the `claude` wrapper |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code config directory |
+| `NVM_DIR` | `~/.nvm` | Where to look for `nvm.sh`, so `claude` is on `PATH` |
 | `UPDATER_LOG` | `~/.claude/unattended-update.log` | Log file |
 | `UPDATER_TMUX_SESSION` | `daemon` | tmux session name, with `UPDATER_TMUX_SOCKET` |
 | `UPDATER_PASS_DEADLINE` | `43200` | Give up on the whole pass after this many seconds |
 | `UPDATER_CLAUDE_TIMEOUT` | `120` | Timeout for a single `claude` query |
 | `UPDATER_INSTALL_TIMEOUT` | `900` | Timeout for the install and for a session resume |
+| `UPDATER_MAX_RETRIES` | `3` | Resume attempts for a session that was stopped and did not come back |
 
 A systemd **user** service does not inherit your login shell's environment, so
 exporting these from `~/.bashrc` has no effect on the timer. Set them on the
@@ -178,6 +191,10 @@ phantom pin to the job that really owns the transcript.
   earlier removes what `--repair` needs to put a pin back.
 - Restarting a session starts a fresh context window. It resumes the conversation,
   it does not preserve an in-flight turn — which is why it waits for idle.
+- A session's own launch flags are replayed so it comes back configured as it
+  was, with one exception: `--reply-on-resume` is dropped. That flag makes a
+  session take a turn the moment it is resumed, and a restart for an update has
+  to be inert.
 
 ## License
 

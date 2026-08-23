@@ -38,6 +38,29 @@ every session was skipped.
 
 It emits a raw ANSI terminal dump, not text. Use `claude agents --json` for state.
 
+## `claude agents --json` is not a liveness list
+
+It reports every job the daemon has a process for, `state: done` included, and it
+keeps reporting a job after that process has been replaced. Treating presence in
+that listing as "this session is healthy" hides the case pin repair exists for: a
+resumed job holds its conversation only in the process the resume started, since
+its own `resumeSessionId` names a transcript that does not exist until the
+session is next prompted, and its `respawnFlags` carry no `--resume`. Respawn it
+— a reboot is enough — and the daemon lists a live job with nothing behind it.
+
+`startedAt` is per process and changes on respawn, so `.updater-pin-source`
+records it next to the source job id and repair compares the two. Do not
+simplify that back to a membership test.
+
+## `--reply-on-resume` makes a resume take a turn
+
+`claude --background --resume` injects no prompt, so a resumed session comes back
+idle — unless its `respawnFlags` carry `--reply-on-resume`, which makes it start
+a turn immediately. Several real jobs on a working box carry it. The updater
+filters that flag out of the ones it replays; do not "restore" it for fidelity,
+or an unattended restart will begin work under whatever `--permission-mode` the
+session had.
+
 ## Two packaging traps that fail silently
 
 **`dpkg-scanpackages --arch` selects on the filename.** It matches `*_all.deb`
@@ -46,7 +69,10 @@ package asset away from nfpm's default produces empty indexes with every command
 still exiting 0. `scripts/build-package-repos.sh` fails loudly on an empty index
 for this reason — do not "fix" that guard by removing it.
 
-**An unsigned rpm is not a build error.** `rpm --checksig` reports `digests OK`
-for an unsigned package and `digests signatures OK` for a signed one; both exit
-0. Only the header signature satisfies `gpgcheck=1` — signing `repomd.xml` does
-not. The release workflow greps for `signatures OK` explicitly.
+**An unsigned rpm is not a build error, and `rpm --checksig` cannot tell you so
+here.** Only the header signature satisfies `gpgcheck=1`; signing `repomd.xml`
+does not. `rpm --checksig` checks against rpm's own keyring, and `rpm --import`
+needs an initialised rpm database, which Debian-family hosts lack — it fails
+silently, taking the check with it. Both the release workflow and the repository
+builder read `%{RSAHEADER:pgpsig}` and `%{SIGPGP:pgpsig}` off the package
+instead, and treat `(none)|(none)` as unsigned.

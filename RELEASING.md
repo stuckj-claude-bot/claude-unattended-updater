@@ -34,10 +34,18 @@ build time by nfpm's `rpm.signature` block. Signing only `repomd.xml` satisfies
 `repo_gpgcheck=1` and nothing else — an rpm covered by signed metadata but
 unsigned itself fails to install with "package is not signed".
 
-An unsigned rpm is not an error at build time; `rpm --checksig` simply reports
-`digests OK` instead of `digests signatures OK`. The release workflow greps for
-`signatures OK` and fails the release when it is missing, and the repository
-builder repeats the check before publishing.
+An unsigned rpm is not an error at build time. The release workflow reads the
+signature tags off the package —
+
+```bash
+rpm -qp --nosignature --qf '%{RSAHEADER:pgpsig}|%{SIGPGP:pgpsig}' dist/*.rpm
+```
+
+— and fails the release when both come back `(none)`; the repository builder
+repeats that check before publishing. Reading the header is deliberate:
+`rpm --checksig` verifies against rpm's own keyring, and `rpm --import` needs an
+initialised rpm database that a Debian-family runner does not have, so the
+import fails silently and takes the gate down with it.
 
 Deb needs no equivalent: APT chains trust from the signed `Release` through
 `Packages`' SHA256 to each `.deb`, and does not check per-package signatures.

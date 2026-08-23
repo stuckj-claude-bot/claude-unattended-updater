@@ -11,7 +11,7 @@
 # Unlike a project shipping large binaries, the packages here are a few
 # kilobytes, so gh-pages carries the whole pool rather than only the current
 # version. That keeps Filename resolution trivial — APT resolves it against the
-# sources.list root, which is the Pages site.
+# URIs value in the client stanza, which is the /apt subdirectory.
 #
 # Everything is built under .repobuild/ before anything is published, so a
 # failure while building leaves the live repositories untouched.
@@ -25,7 +25,7 @@ PAGES_URL="${PAGES_URL:-https://${REPO%%/*}.github.io/${REPO##*/}}"
 KEY="${GPG_KEY_ID:?GPG_KEY_ID must be set}"
 SUITE="${SUITE:-stable}"
 LABEL="${LABEL:-claude-unattended-updater}"
-ARCHES="${ARCHES:-amd64 arm64 armhf i386}"
+ARCHES="${ARCHES:-amd64 arm64 armhf i386 ppc64el s390x riscv64}"
 export GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 
 # Defaulting to a dry run means inspecting the script locally, or typing the
@@ -68,7 +68,8 @@ for f in pages/apt/pool/main/*.deb; do
   [ -e "$f" ] || continue
   # Match the path column exactly: an unanchored search also passes for a
   # package that merely mentions the name somewhere under another prefix.
-  dpkg-deb -c "$f" | awk '{print $NF}' | grep -qx './usr/bin/claude-unattended-update' \
+  paths="$(dpkg-deb -c "$f" | awk '{print $NF}')"
+  printf '%s\n' "$paths" | grep -qx './usr/bin/claude-unattended-update' \
     || die "$(basename "$f") does not ship ./usr/bin/claude-unattended-update"
 done
 debs=$(find pages/apt/pool/main -name '*.deb' | wc -l)
@@ -100,7 +101,12 @@ with open(p, "w") as fh:
         fh.write(s + "\n\n")
 PY
     gzip -nkf "dists/$SUITE/main/binary-$a/Packages"   # -n: no mtime
-    echo "  $a: $(grep -c '^Package:' "dists/$SUITE/main/binary-$a/Packages") entries"
+    indexed="$(grep -c '^Package:' "dists/$SUITE/main/binary-$a/Packages")"
+    # Every package here is Architecture: all, so each arch index must list all
+    # of them; a short count means an asset's filename did not match.
+    [ "$indexed" -eq "$debs" ] \
+      || die "$SUITE/$a indexed $indexed of $debs packages — check the asset filenames"
+    echo "  $a: $indexed entries"
   done
 
   ( cd "dists/$SUITE"
@@ -171,7 +177,8 @@ if [ "$rpms" -gt 0 ]; then
     done
     echo "  all $rpms rpm(s) signed"
   else
-    echo "  WARNING: rpm not installed, cannot verify header signatures here"
+    [ "$DRY_RUN" = 1 ] || die "rpm is required to verify header signatures before publishing"
+    echo "  rpm not installed; header signatures unverified in this dry run"
   fi
 fi
 

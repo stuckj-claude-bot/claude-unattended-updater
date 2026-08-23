@@ -14,4 +14,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck -S warning bin/claude-unattended-update install.sh scripts/build-package-repos.sh
+        run: |
+          shellcheck -S warning bin/claude-unattended-update install.sh \
+            scripts/build-package-repos.sh tests/repair-scenarios.sh
+
+  scenarios:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pin repair scenarios
+        run: tests/repair-scenarios.sh
