@@ -21,7 +21,7 @@
 #     left on the old job id points at a dead job; step 4 moves it. --repair
 #     fixes pins that already went stale this way.
 #
-# Usage: claude-unattended-update [--dry-run] [--force] [--repair]
+# Usage: claude-unattended-update [--dry-run] [--force] [--repair] [--forget <job-id>]
 
 set -uo pipefail
 
@@ -133,18 +133,17 @@ import json, sys
 # resume minted. Comparing wall-clock start times instead would reject a session
 # the daemon stamped a moment early.
 before = set(sys.argv[1].split())
-best = None
+cwd = sys.argv[2]
 try: d = json.load(sys.stdin)
 except Exception: raise SystemExit
-for x in d:
-    if x.get("kind") != "background": continue
-    ident = str(x.get("id"))
-    if ident in before: continue
-    ts = x.get("startedAt") or 0
-    if best is None or ts > best[1]:
-        best = (ident, ts)
-if best:
-    print(best[0])
+fresh = [str(x.get("id")) for x in d
+         if x.get("kind") == "background"
+         and str(x.get("id")) not in before
+         and x.get("cwd") == cwd]
+# Exactly one new job in this directory is an identification; more than one is a
+# guess, and guessing moves a pin onto an unrelated conversation.
+if len(fresh) == 1:
+    print(fresh[0])
 '
 PY_STATE='
 import json, os, sys, tempfile
@@ -168,6 +167,8 @@ if action == "record":
     d["failed"] = [f for f in d["failed"] if f.get("id") != ident]
     d["failed"].append({"id": ident, "sessionId": sid, "cwd": cwd,
                         "name": name, "respawnFlags": flags})
+elif action == "count-failed":
+    print(len(d["failed"])); raise SystemExit
 elif action == "count-attempts":
     for f in d["failed"]:
         if f.get("id") == sys.argv[3]:
@@ -184,7 +185,9 @@ elif action == "attempt":
     else:
         raise SystemExit
 elif action == "drop":
-    d["failed"] = [f for f in d["failed"] if f.get("id") != sys.argv[3]]
+    kept = [f for f in d["failed"] if f.get("id") != sys.argv[3]]
+    print("dropped" if len(kept) != len(d["failed"]) else "absent")
+    d["failed"] = kept
 elif action == "pending":
     d["rolloutVersion"] = sys.argv[3]
     d["pending"] = sys.argv[4:]
@@ -392,7 +395,7 @@ while queue:
         print(f"    ambiguous: {names} were active within a minute — refusing to guess")
         unrepaired = True; continue
     other, osid, size, _ = cands[0]
-    print(f"    -> job {other} owns {osid} ({size/1e6:.1f}MB)")
+    print(f"    -> best guess: job {other} owns {osid} ({size/1e6:.1f}MB)")
     if mode != "apply":
         unrepaired = True
         continue
@@ -424,10 +427,15 @@ if ! flock -n 9; then
   exit 0
 fi
 
+if [ "$FORGET_NEXT" -eq 1 ]; then
+  echo "--forget needs a job id" >&2; exit 2
+fi
 if [ -n "$FORGET_ID" ]; then
-  python3 -c "$PY_STATE" "$STATE" drop "$FORGET_ID"
-  say "forgot the failure record for $FORGET_ID"
-  exit 0
+  if [ "$(python3 -c "$PY_STATE" "$STATE" drop "$FORGET_ID")" = dropped ]; then
+    say "forgot the failure record for $FORGET_ID"
+    exit 0
+  fi
+  say "no failure record for $FORGET_ID"; exit 1
 fi
 
 if [ "$REPAIR_ONLY" -eq 1 ]; then
@@ -472,8 +480,8 @@ resume_session() {
     mapfile -d '' -t flags < "$WORKFILE"
   fi
   [ "${#flags[@]}" -gt 0 ] || return 1
-  local before
-  before="$(agents_json </dev/null | python3 -c 'import json,sys;print(" ".join(str(x.get("id")) for x in json.load(sys.stdin)))' 2>/dev/null)" || before=""
+  local before before_ok=1
+  before="$(agents_json </dev/null | python3 -c 'import json,sys;print(" ".join(str(x.get("id")) for x in json.load(sys.stdin)))' 2>/dev/null)" || before_ok=0
   out="$(cd "$cwd" || exit 1; \
          DISABLE_AUTOUPDATER=1 timeout "$INSTALL_TIMEOUT" \
            "$CLAUDE" --background --resume "$sid" "${flags[@]}" 2>&1 </dev/null)"
@@ -482,7 +490,9 @@ resume_session() {
   if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
     # Failing to read the announcement is not evidence that no session started,
     # and recording a live session as failed makes the retry fork a second copy.
-    newid="$(agents_json </dev/null | python3 -c "$PY_FIND_NEW" "$before")"
+    if [ "$before_ok" -eq 1 ]; then
+      newid="$(agents_json </dev/null | python3 -c "$PY_FIND_NEW" "$before" "$cwd")"
+    fi
   fi
   if [ -z "$newid" ] || [ ! -d "$JOBS/$newid" ]; then
     printf '%s\n' "$out" >>"$LOG"
@@ -637,7 +647,7 @@ if [ "${count:-0}" -eq 0 ]; then
     # removes the file when nothing at all is outstanding.
     python3 -c "$PY_STATE" "$STATE" pending "$new_version"
   fi
-  if [ -s "$STATE" ]; then
+  if [ "$(python3 -c "$PY_STATE" "$STATE" count-failed 2>/dev/null || echo 0)" -gt 0 ]; then
     say "no sessions on the old binary, but earlier failures are still recorded"
     exit 1
   fi
