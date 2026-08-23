@@ -180,6 +180,55 @@ check "a resume that came up despite a non-zero exit is adopted" '["cc33dd44"]' 
 check "  and is not recorded as failed" "absent" \
   "$([ -f "$R/unattended-update-state.json" ] && echo present || echo absent)"
 
+# A job this tool resumed has no transcript under its own session id until it
+# is prompted, so a later rollout that resumes that id finds nothing and the
+# session is destroyed. It has to resume the source session instead.
+S2="$WORK/second"
+mkdir -p "$S2/jobs/srcjob00" "$S2/jobs/resumed1" "$S2/projects/-h" "$S2/fake" "$S2/wd" "$S2/bin"
+printf '{"name":"s","cwd":"%s/wd","resumeSessionId":"sid-src","respawnFlags":["--model","opus"]}\n' "$S2" \
+  > "$S2/jobs/srcjob00/state.json"
+printf '{"name":"s","cwd":"%s/wd","resumeSessionId":"sid-resumed","respawnFlags":["--model","opus"]}\n' "$S2" \
+  > "$S2/jobs/resumed1/state.json"
+# Only the source job ever wrote a transcript.
+echo x > "$S2/projects/-h/sid-src.jsonl"
+printf 'srcjob00\nstartedAt=1000\n' > "$S2/jobs/resumed1/.updater-pin-source"
+printf '["resumed1"]' > "$S2/jobs/pins.json"
+cat > "$S2/fake/claude" <<FAKE
+#!/bin/bash
+case "\$1" in
+  --version) echo "$VERSION";;
+  agents)
+    if [ -f "$S2/resumed" ]; then
+      echo '[{"id":"dd44ee55","sessionId":"sid-2","cwd":"$S2/wd","name":"s","kind":"background","status":"idle","startedAt":3000}]'
+    elif [ -f "$S2/down" ]; then echo '[]'
+    else echo '[{"id":"resumed1","sessionId":"sid-resumed","cwd":"$S2/wd","name":"s","kind":"background","status":"idle","startedAt":1000}]'; fi;;
+  stop) touch "$S2/down"; exit 0;;
+  --background)
+    shift; want=""
+    while [ \$# -gt 0 ]; do [ "\$1" = "--resume" ] && { want="\$2"; break; }; shift; done
+    echo "\$want" >> "$S2/resumed-with"
+    # The real CLI refuses a session id with no transcript.
+    if [ ! -f "$S2/projects/-h/\$want.jsonl" ]; then
+      echo "No conversation found with session ID: \$want"; exit 1
+    fi
+    touch "$S2/resumed"
+    mkdir -p "$S2/jobs/dd44ee55"
+    printf '{"name":"s","cwd":"$S2/wd","resumeSessionId":"sid-2","respawnFlags":["--model","opus"]}\\n' \\
+      > "$S2/jobs/dd44ee55/state.json"
+    echo "backgrounded · dd44ee55 · s";;
+  *) echo "$VERSION";;
+esac
+FAKE
+chmod +x "$S2/fake/claude"
+cp "$E/bin/curl" "$S2/bin/curl"
+PATH="$S2/bin:$PATH" CLAUDE_BIN="$S2/fake/claude" CLAUDE_CONFIG_DIR="$S2" \
+  UPDATER_POLL=1 UPDATER_IDLE_STREAK=1 "$BIN" --force >"$S2/out" 2>&1
+check "a second rollout resumes the source session, not the empty one" "sid-src" \
+  "$(head -1 "$S2/resumed-with" 2>/dev/null)"
+check "  and the session comes back" '["dd44ee55"]' "$(tr -d '\n ' < "$S2/jobs/pins.json")"
+check "  with nothing recorded as failed" "absent" \
+  "$([ -f "$S2/unattended-update-state.json" ] && echo present || echo absent)"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

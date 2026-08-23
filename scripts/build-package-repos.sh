@@ -68,7 +68,8 @@ for f in pages/apt/pool/main/*.deb; do
   [ -e "$f" ] || continue
   # Match the path column exactly: an unanchored search also passes for a
   # package that merely mentions the name somewhere under another prefix.
-  dpkg-deb -c "$f" | awk '{print $NF}' | grep -qx './usr/bin/claude-unattended-update' \
+  paths="$(dpkg-deb -c "$f" | awk '{print $NF}')"
+  printf '%s\n' "$paths" | grep -qx './usr/bin/claude-unattended-update' \
     || die "$(basename "$f") does not ship ./usr/bin/claude-unattended-update"
 done
 debs=$(find pages/apt/pool/main -name '*.deb' | wc -l)
@@ -176,7 +177,8 @@ if [ "$rpms" -gt 0 ]; then
     done
     echo "  all $rpms rpm(s) signed"
   else
-    echo "  WARNING: rpm not installed, cannot verify header signatures here"
+    [ "$DRY_RUN" = 1 ] || die "rpm is required to verify header signatures before publishing"
+    echo "  rpm not installed; header signatures unverified in this dry run"
   fi
 fi
 

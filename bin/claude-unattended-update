@@ -220,20 +220,45 @@ with os.fdopen(fd, "w") as fh:
     fh.flush(); os.fsync(fh.fileno())
 os.replace(tmp, path)
 '
+PY_MARK='
+import os, sys
+JOBS, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+started = sys.argv[4] if len(sys.argv) > 4 else ""
+marker = os.path.join(JOBS, new, ".updater-pin-source")
+lines = []
+if os.path.exists(marker):
+    lines = [l for l in open(marker).read().split("\n") if l.strip()]
+if not lines:
+    lines = [old]
+if started and not any(l.startswith("startedAt=") for l in lines):
+    lines.append("startedAt=" + started)
+fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+with os.fdopen(fd, "w") as fh:
+    fh.write("\n".join(lines) + "\n")
+    fh.flush(); os.fsync(fh.fileno())
+'
+PY_RESOLVE_SID='
+import glob, json, os, sys
+JOBS, PROJ, job, sid = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+def has(s):
+    return bool(s) and bool(glob.glob(os.path.join(PROJ, "*", s + ".jsonl")))
+
+if has(sid):
+    print(sid); raise SystemExit
+try:
+    src = open(os.path.join(JOBS, job, ".updater-pin-source")).read().split("\n")[0].strip()
+    d = json.load(open(os.path.join(JOBS, src, "state.json")))
+except Exception:
+    raise SystemExit
+osid = d.get("resumeSessionId") or d.get("sessionId")
+if has(osid):
+    print(osid)
+'
 PY_MOVE_PIN='
 import json, os, shutil, sys, tempfile
 JOBS, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
 p = os.path.join(JOBS, "pins.json")
-marker = os.path.join(JOBS, new, ".updater-pin-source")
-started = sys.argv[4] if len(sys.argv) > 4 else ""
-# Written even when the job was not pinned, so --repair can always tell a
-# resumed session from a pin orphaned by a reaped respawn. Never overwrite one:
-# a marker that already names a different job belongs to that job.
-if not os.path.exists(marker):
-    with open(marker, "w") as fh:
-        fh.write(old + "\n")
-        if started:
-            fh.write("startedAt=" + started + "\n")
 try: pins = json.load(open(p))
 except Exception: raise SystemExit
 if old not in pins: raise SystemExit
@@ -528,6 +553,7 @@ resume_session() {
     return 2
   fi
   say "    resumed as $newid"
+  python3 -c "$PY_MARK" "$JOBS" "$id" "$newid" >>"$LOG" 2>&1 || true
   # The start time of the process now holding the conversation; repair uses it
   # to tell this session from a later respawn of the same job.
   started=""
@@ -542,7 +568,8 @@ for x in json.load(sys.stdin):
     [ -n "$started" ] && break
     sleep 1
   done
-  python3 -c "$PY_MOVE_PIN" "$JOBS" "$id" "$newid" "$started" >>"$LOG" 2>&1 \
+  [ -n "$started" ] && { python3 -c "$PY_MARK" "$JOBS" "$id" "$newid" "$started" >>"$LOG" 2>&1 || true; }
+  python3 -c "$PY_MOVE_PIN" "$JOBS" "$id" "$newid" >>"$LOG" 2>&1 \
     || say "    WARNING: $name resumed as $newid but its pin could not be moved; see $LOG"
   return 0
 }
@@ -578,9 +605,11 @@ retry_failed() {
     tries="$(python3 -c "$PY_STATE" "$STATE" attempt "$id")"
     say "retrying $name, stopped by an earlier pass and never resumed (attempt $tries)"
     python3 -c "$PY_STATE" "$STATE" flags "$id" > "$FLAGFILE" 2>/dev/null
-    resume_session "$id" "$sid" "$cwd" "$name" "$FLAGFILE"; rrc=$?
+    sid_eff="$(python3 -c "$PY_RESOLVE_SID" "$JOBS" "$PROJECTS" "$id" "$sid" 2>/dev/null)"
+    [ -z "$sid_eff" ] && sid_eff="$sid"
+    resume_session "$id" "$sid_eff" "$cwd" "$name" "$FLAGFILE"; rrc=$?
     if [ "$rrc" -eq 2 ]; then
-      say "  $name came back but could not be identified; clearing its record"
+      say "  $name came back but could not be identified; its pin was not moved"
       python3 -c "$PY_STATE" "$STATE" drop "$id" >/dev/null
       continue
     fi
@@ -753,6 +782,12 @@ while IFS=$'\x1f' read -r -d '' id sid cwd name; do
     pending="$pending $id"
     continue
   fi
+  sid_eff="$(python3 -c "$PY_RESOLVE_SID" "$JOBS" "$PROJECTS" "$id" "$sid" 2>/dev/null)"
+  if [ -z "$sid_eff" ]; then
+    say "    $name has no resumable transcript; leaving it alone"
+    pending="$pending $id"
+    continue
+  fi
   if ! python3 -c "$PY_STATE" "$STATE" record "$id" "$sid" "$cwd" "$name"; then
     # This record is the only thing that survives the stop; without it a failure
     # later in the restart loses the session silently.
@@ -784,7 +819,7 @@ while IFS=$'\x1f' read -r -d '' id sid cwd name; do
     continue
   fi
 
-  resume_session "$id" "$sid" "$cwd" "$name"; rrc=$?
+  resume_session "$id" "$sid_eff" "$cwd" "$name"; rrc=$?
   if [ "$rrc" -eq 0 ]; then
     python3 -c "$PY_STATE" "$STATE" drop "$id" >/dev/null
     continue
